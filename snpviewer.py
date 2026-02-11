@@ -192,7 +192,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                s_db = network.s_db[:, m, n]
+                s_mag = np.abs(network.s[:, m, n])
+                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
                 label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                 self.ax.plot(freq, s_db, color=color,
                              label=label, linewidth=1.8)
