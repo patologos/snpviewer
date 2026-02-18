@@ -38,6 +38,7 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.widgets import SpanSelector
 
 import skrf as rf
 
@@ -357,6 +358,240 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     def show_placeholder(self):
         self._show_placeholder()
+
+    # ------------------------------------------------------------------
+    # Q-factor measurement via interactive span selection
+    # ------------------------------------------------------------------
+
+    def start_q_measurement(self, callback):
+        """Enable a span-selector on the current axes for Q measurement.
+
+        *callback* is called with a list of per-trace result dicts once
+        the user finishes dragging a region.  The selector is automatically
+        removed afterwards.
+        """
+        if self.ax is None:
+            return
+
+        self._q_callback = callback
+        self._q_span = SpanSelector(
+            self.ax,
+            self._on_q_span_selected,
+            direction='horizontal',
+            useblit=True,
+            props=dict(alpha=0.25, facecolor=NatureColors.CYAN),
+            interactive=False,
+        )
+        self.setCursor(Qt.CrossCursor)
+
+    def _on_q_span_selected(self, xmin, xmax):
+        """Called by SpanSelector when the user releases the mouse."""
+        # Tear down the selector immediately
+        if hasattr(self, '_q_span') and self._q_span is not None:
+            self._q_span.set_visible(False)
+            self._q_span = None
+        self.setCursor(Qt.ArrowCursor)
+
+        results = self._compute_q_all_traces(xmin, xmax)
+        if hasattr(self, '_q_callback') and self._q_callback:
+            self._q_callback(results)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_freq_unit(self):
+        """Extract the frequency unit string from the x-axis label."""
+        xlabel = self.ax.get_xlabel() if self.ax else ''
+        for unit in ('THz', 'GHz', 'MHz', 'kHz', 'Hz'):
+            if unit in xlabel:
+                return unit
+        return ''
+
+    def _compute_q_one_trace(self, xdata, ydata, xmin, xmax):
+        """Compute Q for a single (xdata, ydata) trace within [xmin, xmax].
+
+        Returns a dict on success, or None if the 3 dB crossings cannot be
+        found.
+        """
+        mask = (xdata >= xmin) & (xdata <= xmax)
+        if mask.sum() < 3:
+            return None
+
+        xr = xdata[mask]
+        yr = ydata[mask]
+
+        # Peak = maximum dB in range
+        peak_idx = int(np.argmax(yr))
+        f0 = xr[peak_idx]
+        peak_db = yr[peak_idx]
+        half_power_db = peak_db - 3.0
+
+        # Left 3 dB crossing (search left of peak)
+        left_f = None
+        for i in range(peak_idx, 0, -1):
+            if yr[i - 1] <= half_power_db:
+                dx = xr[i] - xr[i - 1]
+                dy = yr[i] - yr[i - 1]
+                if dy != 0:
+                    left_f = xr[i - 1] + (half_power_db - yr[i - 1]) * dx / dy
+                break
+
+        # Right 3 dB crossing (search right of peak)
+        right_f = None
+        for i in range(peak_idx, len(xr) - 1):
+            if yr[i + 1] <= half_power_db:
+                dx = xr[i + 1] - xr[i]
+                dy = yr[i + 1] - yr[i]
+                if dy != 0:
+                    right_f = xr[i] + (half_power_db - yr[i]) * dx / dy
+                break
+
+        if left_f is None or right_f is None:
+            return None
+
+        bw = right_f - left_f
+        if bw <= 0:
+            return None
+
+        return {
+            'f0': f0,
+            'bw': bw,
+            'q': f0 / bw,
+            'peak_db': peak_db,
+            'half_power_db': half_power_db,
+            'left_f': left_f,
+            'right_f': right_f,
+        }
+
+    def _compute_q_all_traces(self, xmin, xmax):
+        """Compute Q for every visible data line in [xmin, xmax].
+
+        Returns a list of dicts (one per trace that succeeded), each
+        containing the trace label, colour, and Q-factor values.
+        Returns an empty list if no traces could be measured.
+        """
+        if self.ax is None:
+            return []
+
+        f_unit = self._get_freq_unit()
+        results = []
+
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            # Skip annotation lines (axhline/axvline have only 2 points)
+            if xd is None or len(xd) <= 2:
+                continue
+            xdata = np.asarray(xd, dtype=float)
+            ydata = np.asarray(yd, dtype=float)
+
+            r = self._compute_q_one_trace(xdata, ydata, xmin, xmax)
+            if r is not None:
+                r['label'] = ln.get_label() or ''
+                r['color'] = ln.get_color()
+                r['f_unit'] = f_unit
+                results.append(r)
+
+        return results
+
+    def annotate_q_results(self, results):
+        """Draw Q-measurement annotations for all traces.
+
+        *results* is the list returned by _compute_q_all_traces().
+        Each trace gets its own colour-matched markers and a shared
+        text box listing all results.
+        """
+        if not results or self.ax is None:
+            return
+
+        self._clear_q_annotations()
+        self._q_annotations = []
+
+        f_unit = results[0]['f_unit']
+
+        # Build the combined result text (one line-pair per trace)
+        text_lines = []
+        for r in results:
+            f0_str = f"{r['f0']:.6g}"
+            bw_str = f"{r['bw']:.6g}"
+            q_str  = f"{r['q']:.0f}"
+            lbl = r['label']
+            if lbl and not lbl.startswith('_'):
+                header = lbl
+            else:
+                header = None
+
+            if header:
+                text_lines.append(header)
+            text_lines.append(
+                f"f0 = {f0_str} {f_unit}   BW = {bw_str} {f_unit}   Q = {q_str}"
+            )
+
+        txt = '\n'.join(text_lines)
+
+        # One text box for all results, placed top-left in axes coords
+        text_ann = self.ax.text(
+            0.02, 0.97, txt,
+            transform=self.ax.transAxes,
+            fontsize=9, verticalalignment='top',
+            family='monospace',
+            bbox=dict(
+                boxstyle='round,pad=0.5',
+                facecolor='white',
+                edgecolor='#555555',
+                alpha=0.93,
+            ),
+            color='#222222',
+        )
+        self._q_annotations.append(text_ann)
+
+        # Per-trace markers using each trace's own colour
+        for r in results:
+            c = r['color']
+            f0     = r['f0']
+            left_f = r['left_f']
+            right_f = r['right_f']
+            half_db = r['half_power_db']
+
+            # Vertical line at f0 (solid)
+            self._q_annotations.append(
+                self.ax.axvline(f0, color=c, linestyle='-',
+                                linewidth=1.4, alpha=0.75)
+            )
+            # Vertical lines at 3 dB crossings (dotted)
+            self._q_annotations.append(
+                self.ax.axvline(left_f, color=c, linestyle=':',
+                                linewidth=1.1, alpha=0.75)
+            )
+            self._q_annotations.append(
+                self.ax.axvline(right_f, color=c, linestyle=':',
+                                linewidth=1.1, alpha=0.75)
+            )
+            # Horizontal dashed line at the -3 dB level
+            self._q_annotations.append(
+                self.ax.axhline(half_db, color=c, linestyle='--',
+                                linewidth=1.1, alpha=0.75)
+            )
+            # Double-headed arrow spanning the BW
+            self._q_annotations.append(
+                self.ax.annotate(
+                    '', xy=(right_f, half_db), xytext=(left_f, half_db),
+                    arrowprops=dict(arrowstyle='<->', color=c, lw=1.4),
+                )
+            )
+
+        self.draw()
+
+    def _clear_q_annotations(self):
+        """Remove any existing Q-factor annotation artists."""
+        if hasattr(self, '_q_annotations'):
+            for artist in self._q_annotations:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        self._q_annotations = []
 
 
 # ---------------------------------------------------------------------------
@@ -963,11 +1198,28 @@ class SNPViewerApp(QMainWindow):
         save_action.triggered.connect(self._on_save)
         toolbar.addAction(save_action)
 
+        toolbar.addSeparator()
+
+        self.q_action = QAction("Measure Q", self)
+        self.q_action.setToolTip(
+            "Drag a region around a peak to compute Q = f0 / (3 dB bandwidth)"
+        )
+        self.q_action.setCheckable(True)
+        self.q_action.setEnabled(False)
+        self.q_action.triggered.connect(self._on_q_action_toggled)
+        toolbar.addAction(self.q_action)
+
+        self.clear_q_action = QAction("Clear Q", self)
+        self.clear_q_action.setToolTip("Remove Q-factor annotations from the plot")
+        self.clear_q_action.setEnabled(False)
+        self.clear_q_action.triggered.connect(self._on_clear_q)
+        toolbar.addAction(self.clear_q_action)
+
     def _connect_signals(self):
         """Wire up all signals and slots."""
         self.file_list.selection_updated.connect(self._on_selection_changed)
         self.param_selector.selection_changed.connect(self._replot)
-        self.plot_tab_bar.currentChanged.connect(self._replot)
+        self.plot_tab_bar.currentChanged.connect(self._on_tab_changed)
         self.btn_add.clicked.connect(self.open_files)
         self.btn_remove.clicked.connect(self._on_remove)
         self.conversion_panel.save_btn.clicked.connect(self._on_save)
@@ -1008,6 +1260,9 @@ class SNPViewerApp(QMainWindow):
         self.conversion_panel.update_for_network(current_net)
         self._replot()
         self._update_selection_status(networks)
+        # Q button only active on magnitude tab when data is present
+        on_magnitude = (self.plot_tab_bar.currentIndex() == self.PLOT_MAGNITUDE)
+        self.q_action.setEnabled(on_magnitude and bool(networks))
 
     def _on_remove(self):
         """Remove all selected files from the list."""
@@ -1017,6 +1272,9 @@ class SNPViewerApp(QMainWindow):
             self.canvas.show_placeholder()
             self.param_selector.update_for_networks([])
             self.conversion_panel.update_for_network(None)
+            self.q_action.setEnabled(False)
+            self.q_action.setChecked(False)
+            self.clear_q_action.setEnabled(False)
             self._update_status("No files loaded.")
 
     def _on_save(self):
@@ -1032,6 +1290,14 @@ class SNPViewerApp(QMainWindow):
 
     def _replot(self):
         """Replot based on current state (all selected files overlaid)."""
+        # Clear any pending Q span and annotations when the plot changes
+        if hasattr(self.canvas, '_q_span') and self.canvas._q_span:
+            self.canvas._q_span.set_visible(False)
+            self.canvas._q_span = None
+        self.canvas._clear_q_annotations()
+        self.q_action.setChecked(False)
+        self.clear_q_action.setEnabled(False)
+
         networks = self.file_list.get_selected_networks()
         if not networks:
             self.canvas.show_placeholder()
@@ -1050,6 +1316,74 @@ class SNPViewerApp(QMainWindow):
             self.canvas.plot_vswr(networks, params)
         elif plot_type == self.PLOT_GROUP_DELAY:
             self.canvas.plot_group_delay(networks, params)
+
+    def _on_tab_changed(self, index):
+        """Handle plot-type tab change; replot and update Q button state."""
+        self._replot()
+        # Q measurement only meaningful on the Magnitude (dB) tab
+        on_magnitude = (index == self.PLOT_MAGNITUDE)
+        networks = self.file_list.get_selected_networks()
+        has_data = bool(networks)
+        self.q_action.setEnabled(on_magnitude and has_data)
+        if not on_magnitude:
+            self.q_action.setChecked(False)
+            self.canvas._clear_q_annotations()
+            self.clear_q_action.setEnabled(False)
+
+    def _on_q_action_toggled(self, checked):
+        """Start or cancel Q-factor span selection."""
+        if checked:
+            self._update_status(
+                "Q Measure: drag a region around a peak, then release."
+            )
+            self.canvas.start_q_measurement(self._on_q_result)
+        else:
+            # User un-toggled manually — cancel any pending selector
+            if hasattr(self.canvas, '_q_span') and self.canvas._q_span:
+                self.canvas._q_span.set_visible(False)
+                self.canvas._q_span = None
+            self.canvas.setCursor(Qt.ArrowCursor)
+            self._update_status("Q measurement cancelled.")
+
+    def _on_q_result(self, results):
+        """Receive Q computation results (list, one per trace) and annotate."""
+        # Button reverts to un-checked state
+        self.q_action.setChecked(False)
+
+        if not results:
+            QMessageBox.warning(
+                self, "Q Measurement Failed",
+                "Could not find both 3 dB crossing points in the selected region "
+                "for any trace.\n"
+                "Try selecting a wider range around the peak, or check that the "
+                "peak is clearly defined within the selection."
+            )
+            self._update_status("Q measurement failed — no valid 3 dB crossings found.")
+            return
+
+        self.canvas.annotate_q_results(results)
+        self.clear_q_action.setEnabled(True)
+
+        # Build a compact status-bar summary for all traces
+        parts = []
+        for r in results:
+            lbl = r['label']
+            unit = r['f_unit']
+            f0_str = f"{r['f0']:.6g}"
+            bw_str = f"{r['bw']:.6g}"
+            q_str  = f"{r['q']:.0f}"
+            entry = f"f0={f0_str} {unit}  BW={bw_str} {unit}  Q={q_str}"
+            if lbl and not lbl.startswith('_'):
+                entry = f"[{lbl}] " + entry
+            parts.append(entry)
+        self._update_status("Q: " + "    |    ".join(parts))
+
+    def _on_clear_q(self):
+        """Remove Q annotations from the plot."""
+        self.canvas._clear_q_annotations()
+        self.canvas.draw()
+        self.clear_q_action.setEnabled(False)
+        self._update_status("Q annotations cleared.")
 
     def _update_selection_status(self, networks):
         """Update status bar with info about selected networks."""
