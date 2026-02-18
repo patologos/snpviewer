@@ -113,11 +113,14 @@ class NatureColors:
         return NatureColors.CYCLE[index % len(NatureColors.CYCLE)]
 
     @staticmethod
-    def get_linestyle(index: int) -> str:
-        """Return a line style that advances once per full colour cycle."""
-        n_colors = len(NatureColors.CYCLE)
-        n_styles = len(NatureColors.LINESTYLES)
-        return NatureColors.LINESTYLES[(index // n_colors) % n_styles]
+    def get_linestyle(file_idx: int) -> str:
+        """Return a line style that advances once per file.
+
+        All parameters from the same file share the same dash pattern so
+        files are immediately visually distinguishable even with just 2-3
+        files loaded.  Colors still cycle across individual traces.
+        """
+        return NatureColors.LINESTYLES[file_idx % len(NatureColors.LINESTYLES)]
 
     @staticmethod
     def apply_matplotlib_defaults():
@@ -205,7 +208,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         # Determine best unit from the first network's raw Hz values
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -217,7 +220,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                 self.ax.plot(freq, s_db, color=color,
                              label=label, linewidth=1.8,
-                             linestyle=NatureColors.get_linestyle(trace_idx))
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -239,7 +242,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -251,7 +254,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
                 self.ax.plot(freq, z_db, color=color,
                              label=label, linewidth=1.8,
-                             linestyle=NatureColors.get_linestyle(trace_idx))
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -273,7 +276,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -285,7 +288,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
                 self.ax.plot(freq, y_db, color=color,
                              label=label, linewidth=1.8,
-                             linestyle=NatureColors.get_linestyle(trace_idx))
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -307,7 +310,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -318,7 +321,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                 self.ax.plot(freq, s_deg, color=color,
                              label=label, linewidth=1.8,
-                             linestyle=NatureColors.get_linestyle(trace_idx))
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -373,7 +376,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -388,7 +391,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 label = f'{name} VSWR(S{m+1},{n+1})' if multi else f'VSWR(S{m+1},{n+1})'
                 self.ax.plot(freq, vswr, color=color,
                              label=label, linewidth=1.8,
-                             linestyle=NatureColors.get_linestyle(trace_idx))
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -411,7 +414,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -425,7 +428,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                     self.ax.plot(freq, group_delay * 1e9, color=color,
                                  label=label, linewidth=1.8,
-                                 linestyle=NatureColors.get_linestyle(trace_idx))
+                                 linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
