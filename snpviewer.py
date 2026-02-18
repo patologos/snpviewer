@@ -1,6 +1,13 @@
 """
 SNP Viewer - Touchstone/SNP File Viewer and Converter
 A graphical application for loading, visualizing, and converting S-parameter files.
+
+----------------------------------------------------------------------------
+"THE BEER-WARE LICENSE" (Revision 42):
+The author(s) of this file wrote it. As long as you retain this notice you
+can do whatever you want with this stuff. If we meet some day, and you think
+this stuff is worth it, you can buy me a beer in return.
+----------------------------------------------------------------------------
 """
 
 import sys
@@ -203,6 +210,72 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Magnitude (dB)')
         self._style_axes('Magnitude')
+        self.fig.tight_layout()
+        self.draw()
+
+    def plot_z_magnitude(self, networks, param_list):
+        """Plot Z-parameters magnitude (dB) for multiple networks."""
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        trace_idx = 0
+        multi = len(networks) > 1
+        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
+
+        for name, network in networks:
+            freq, _ = auto_freq_scale(network.frequency.f)
+            n_ports = network.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports or n >= n_ports:
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                z_mag = np.abs(network.z[:, m, n])
+                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
+                label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
+                self.ax.plot(freq, z_db, color=color,
+                             label=label, linewidth=1.8)
+                trace_idx += 1
+
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel('|Z| (dB\u03A9)')
+        self._style_axes('Z-Parameters (Magnitude)')
+        self.fig.tight_layout()
+        self.draw()
+
+    def plot_y_magnitude(self, networks, param_list):
+        """Plot Y-parameters magnitude (dB) for multiple networks."""
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        trace_idx = 0
+        multi = len(networks) > 1
+        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
+
+        for name, network in networks:
+            freq, _ = auto_freq_scale(network.frequency.f)
+            n_ports = network.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports or n >= n_ports:
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                y_mag = np.abs(network.y[:, m, n])
+                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
+                label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
+                self.ax.plot(freq, y_db, color=color,
+                             label=label, linewidth=1.8)
+                trace_idx += 1
+
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel('|Y| (dBS)')
+        self._style_axes('Y-Parameters (Magnitude)')
         self.fig.tight_layout()
         self.draw()
 
@@ -700,15 +773,16 @@ class FileListWidget(QListWidget):
 # ---------------------------------------------------------------------------
 
 class ParameterSelector(QGroupBox):
-    """Dynamic checkbox grid for S-parameter selection."""
+    """Dynamic checkbox grid for S/Z/Y-parameter selection."""
 
     selection_changed = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("S-Parameters", parent)
+        super().__init__("Parameters", parent)
         self._checkboxes = []
         self._layout = QGridLayout()
         self._layout.setSpacing(2)
+        self._param_type = 'S'   # 'S', 'Z', or 'Y'
         self.setLayout(self._layout)
         self.setStyleSheet("""
             QGroupBox {
@@ -729,6 +803,17 @@ class ParameterSelector(QGroupBox):
                 spacing: 3px;
             }
         """)
+
+    def set_param_type(self, param_type):
+        """Switch the displayed parameter type ('S', 'Z', or 'Y') and
+        relabel existing checkboxes without resetting their checked state."""
+        self._param_type = param_type.upper()
+        self.setTitle(f'{self._param_type}-Parameters')
+        p = self._param_type
+        for cb in self._checkboxes:
+            m = cb.property('row')
+            n = cb.property('col')
+            cb.setText(f'{p}{m + 1},{n + 1}')
 
     def update_for_networks(self, networks):
         """Rebuild checkboxes for the union of ports across all networks.
@@ -752,10 +837,11 @@ class ParameterSelector(QGroupBox):
 
         # Use the max port count across all selected networks
         max_ports = max(net.number_of_ports for _, net in networks)
+        p = self._param_type
 
         for m in range(max_ports):
             for n in range(max_ports):
-                cb = QCheckBox(f'S{m + 1},{n + 1}')
+                cb = QCheckBox(f'{p}{m + 1},{n + 1}')
                 cb.setProperty('row', m)
                 cb.setProperty('col', n)
                 # Restore previous state, or use defaults on first build
@@ -769,6 +855,8 @@ class ParameterSelector(QGroupBox):
                 cb.stateChanged.connect(self._on_changed)
                 self._layout.addWidget(cb, m, n)
                 self._checkboxes.append(cb)
+
+        self.setTitle(f'{p}-Parameters')
 
     def get_selected_params(self):
         """Return list of (m, n) tuples for checked parameters."""
@@ -981,11 +1069,16 @@ class SNPViewerApp(QMainWindow):
     PLOT_VSWR = 3
     PLOT_GROUP_DELAY = 4
 
+    # Parameter types that show a magnitude (dB) plot and support Q measurement
+    _MAGNITUDE_PLOTS = {PLOT_MAGNITUDE}
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SNP Viewer")
         self.resize(1200, 750)
         self.setAcceptDrops(True)
+
+        self._param_type = 'S'   # 'S', 'Z', or 'Y'
 
         NatureColors.apply_matplotlib_defaults()
         self._build_ui()
@@ -1200,6 +1293,49 @@ class SNPViewerApp(QMainWindow):
 
         toolbar.addSeparator()
 
+        # S / Z / Y parameter-type toggle buttons
+        _param_btn_style = """
+            QToolButton {{
+                font-size: 9pt;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 3px;
+                border: 1px solid #B0B0B0;
+                background: #F0F0F0;
+                color: #333;
+            }}
+            QToolButton:checked {{
+                background: {active_bg};
+                color: white;
+                border: 1px solid {active_bg};
+            }}
+            QToolButton:hover:!checked {{
+                background: #E0E0E0;
+            }}
+        """
+        self.s_action = QAction("S", self)
+        self.s_action.setCheckable(True)
+        self.s_action.setChecked(True)
+        self.s_action.setToolTip("Display S-parameters")
+        self.s_action.triggered.connect(lambda: self._on_param_type_changed('S'))
+        toolbar.addAction(self.s_action)
+
+        self.z_action = QAction("Z", self)
+        self.z_action.setCheckable(True)
+        self.z_action.setChecked(False)
+        self.z_action.setToolTip("Display Z-parameters (impedance)")
+        self.z_action.triggered.connect(lambda: self._on_param_type_changed('Z'))
+        toolbar.addAction(self.z_action)
+
+        self.y_action = QAction("Y", self)
+        self.y_action.setCheckable(True)
+        self.y_action.setChecked(False)
+        self.y_action.setToolTip("Display Y-parameters (admittance)")
+        self.y_action.triggered.connect(lambda: self._on_param_type_changed('Y'))
+        toolbar.addAction(self.y_action)
+
+        toolbar.addSeparator()
+
         self.q_action = QAction("Measure Q", self)
         self.q_action.setToolTip(
             "Drag a region around a peak to compute Q = f0 / (3 dB bandwidth)"
@@ -1307,7 +1443,12 @@ class SNPViewerApp(QMainWindow):
         plot_type = self.plot_tab_bar.currentIndex()
 
         if plot_type == self.PLOT_MAGNITUDE:
-            self.canvas.plot_magnitude(networks, params)
+            if self._param_type == 'Z':
+                self.canvas.plot_z_magnitude(networks, params)
+            elif self._param_type == 'Y':
+                self.canvas.plot_y_magnitude(networks, params)
+            else:
+                self.canvas.plot_magnitude(networks, params)
         elif plot_type == self.PLOT_PHASE:
             self.canvas.plot_phase(networks, params)
         elif plot_type == self.PLOT_SMITH:
@@ -1317,10 +1458,30 @@ class SNPViewerApp(QMainWindow):
         elif plot_type == self.PLOT_GROUP_DELAY:
             self.canvas.plot_group_delay(networks, params)
 
+    def _on_param_type_changed(self, param_type):
+        """Switch between S, Z, and Y parameter display."""
+        self._param_type = param_type
+
+        # Keep the three toggle buttons mutually exclusive
+        self.s_action.setChecked(param_type == 'S')
+        self.z_action.setChecked(param_type == 'Z')
+        self.y_action.setChecked(param_type == 'Y')
+
+        # Relabel the parameter checkboxes
+        self.param_selector.set_param_type(param_type)
+
+        # Z/Y magnitude plots only make sense on the Magnitude tab;
+        # switch to it if we are not already there.
+        if self.plot_tab_bar.currentIndex() != self.PLOT_MAGNITUDE:
+            # Suppress duplicate replot — tab-change will trigger _replot
+            self.plot_tab_bar.setCurrentIndex(self.PLOT_MAGNITUDE)
+        else:
+            self._replot()
+
     def _on_tab_changed(self, index):
         """Handle plot-type tab change; replot and update Q button state."""
         self._replot()
-        # Q measurement only meaningful on the Magnitude (dB) tab
+        # Q measurement is meaningful on the Magnitude (dB) tab only
         on_magnitude = (index == self.PLOT_MAGNITUDE)
         networks = self.file_list.get_selected_networks()
         has_data = bool(networks)
