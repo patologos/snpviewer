@@ -97,6 +97,10 @@ class NatureColors:
 
     CYCLE = [RED, BLUE, GREEN, CYAN, SALMON, SLATE, MINT, DARK_RED, BROWN, TAN]
 
+    # Line-style cycle — advances once per full colour cycle so traces
+    # are distinguished first by colour, then by dash pattern.
+    LINESTYLES = ['-', '--', '-.', ':']
+
     # UI colors
     BG_LIGHT = '#FAFAFA'
     BG_SIDEBAR = '#F0F0F0'
@@ -107,6 +111,13 @@ class NatureColors:
     @staticmethod
     def get_color(index: int) -> str:
         return NatureColors.CYCLE[index % len(NatureColors.CYCLE)]
+
+    @staticmethod
+    def get_linestyle(index: int) -> str:
+        """Return a line style that advances once per full colour cycle."""
+        n_colors = len(NatureColors.CYCLE)
+        n_styles = len(NatureColors.LINESTYLES)
+        return NatureColors.LINESTYLES[(index // n_colors) % n_styles]
 
     @staticmethod
     def apply_matplotlib_defaults():
@@ -130,9 +141,9 @@ class NatureColors:
             'legend.framealpha': 0.9,
             'legend.edgecolor': '#cccccc',
             'figure.facecolor': 'white',
-            'axes.facecolor': 'white',
-            'axes.grid': True,
-            'grid.alpha': 0.2,
+            'axes.facecolor': '#F5F5F5',
+            'axes.grid': False,
+            'grid.alpha': 0.0,
             'grid.linestyle': '-',
             'grid.color': '#cccccc',
             'lines.linewidth': 1.8,
@@ -175,7 +186,8 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.spines['top'].set_visible(False)
         self.ax.spines['right'].set_visible(False)
         self.ax.legend(loc='best', frameon=True)
-        self.ax.grid(True, alpha=0.2, linestyle='-', color='#cccccc')
+        self.ax.set_facecolor('#F5F5F5')
+        self.ax.grid(False)
 
     def plot_magnitude(self, networks, param_list):
         """Plot S-parameters in dB for multiple networks.
@@ -204,7 +216,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
                 label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                 self.ax.plot(freq, s_db, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -237,7 +250,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
                 label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
                 self.ax.plot(freq, z_db, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -270,7 +284,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
                 label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
                 self.ax.plot(freq, y_db, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -302,7 +317,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_deg = network.s_deg[:, m, n]
                 label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                 self.ax.plot(freq, s_deg, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -371,7 +387,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 vswr = np.clip(vswr, 1, 100)
                 label = f'{name} VSWR(S{m+1},{n+1})' if multi else f'VSWR(S{m+1},{n+1})'
                 self.ax.plot(freq, vswr, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
@@ -407,7 +424,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                     group_delay = -np.gradient(s_phase_rad, omega)
                     label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
                     self.ax.plot(freq, group_delay * 1e9, color=color,
-                                 label=label, linewidth=1.8)
+                                 label=label, linewidth=1.8,
+                                 linestyle=NatureColors.get_linestyle(trace_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
