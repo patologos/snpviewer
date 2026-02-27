@@ -1,6 +1,13 @@
 """
 SNP Viewer - Touchstone/SNP File Viewer and Converter
 A graphical application for loading, visualizing, and converting S-parameter files.
+
+----------------------------------------------------------------------------
+"THE BEER-WARE LICENSE" (Revision 42):
+The author(s) of this file wrote it. As long as you retain this notice you
+can do whatever you want with this stuff. If we meet some day, and you think
+this stuff is worth it, you can buy me a beer in return.
+----------------------------------------------------------------------------
 """
 
 import sys
@@ -13,7 +20,7 @@ try:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QAction, QMessageBox,
-        QSizePolicy, QScrollArea, QFrame
+        QInputDialog, QSizePolicy, QScrollArea, QFrame
     )
     from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize
     from PyQt5.QtGui import QIcon, QFont, QColor, QPalette
@@ -26,7 +33,7 @@ except ImportError:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QMessageBox,
-        QSizePolicy, QScrollArea, QFrame
+        QInputDialog, QSizePolicy, QScrollArea, QFrame
     )
     from PySide6.QtCore import Qt, Signal, QSize
     from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction
@@ -39,6 +46,7 @@ matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
+from scipy.signal import find_peaks
 
 import skrf as rf
 
@@ -71,6 +79,173 @@ def auto_freq_scale(freq_hz):
 
 
 # ---------------------------------------------------------------------------
+# Settings Loader
+# ---------------------------------------------------------------------------
+
+class AppSettings:
+    """Load and expose settings from a human-readable .conf file.
+
+    The file is searched in this order:
+      1. <directory of snpviewer.py>/snpviewer.conf
+      2. ~/.snpviewer.conf
+
+    Lines starting with '#' are comments.  Each setting is a simple
+    ``key = value`` pair.  Unknown keys are silently ignored.
+    """
+
+    _VALID_PARAM_TYPES = {'S', 'Z', 'Y'}
+    _VALID_FORMATS = {'DB', 'MA', 'RI'}
+
+    def __init__(self):
+        # Defaults (used when no conf file is found or a key is missing)
+        self.param_type: str = 'S'
+        self.s_default_params: list = [(0, 0), (1, 0)]  # S1,1 and S2,1
+        self.z_default_params: list = [(0, 0)]
+        self.y_default_params: list = [(0, 0)]
+        self.plot_format: str = 'DB'
+        self.z0: float = 50.0
+
+        # Graph / font settings
+        self.font_family: str = 'sans-serif'
+        self.font_size: int = 10    # base body text
+        self.label_size: int = 11   # axis labels
+        self.title_size: int = 12   # plot title
+        self.tick_size: int = 9     # tick labels
+        self.legend_size: int = 9   # legend text
+
+        self._path = self._find_conf_file()
+        if self._path:
+            self._load(self._path)
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def default_params_for(self, param_type: str) -> list:
+        """Return the default (m, n) list for the given param type."""
+        pt = param_type.upper()
+        if pt == 'Z':
+            return list(self.z_default_params)
+        if pt == 'Y':
+            return list(self.y_default_params)
+        return list(self.s_default_params)
+
+    def conf_path(self):
+        """Return the path to the loaded conf file, or None."""
+        return self._path
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_conf_file():
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'snpviewer.conf'),
+            os.path.expanduser('~/.snpviewer.conf'),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _load(self, path):
+        raw = {}
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip().lower()
+                value = value.strip()
+                # Strip inline comments
+                if '#' in value:
+                    value = value[:value.index('#')].strip()
+                raw[key] = value
+
+        # param_type
+        if 'param_type' in raw:
+            v = raw['param_type'].upper()
+            if v in self._VALID_PARAM_TYPES:
+                self.param_type = v
+
+        # default param selections
+        self.s_default_params = self._parse_params(
+            raw.get('s_default_params', ''), [(0, 0), (1, 0)])
+        self.z_default_params = self._parse_params(
+            raw.get('z_default_params', ''), [(0, 0)])
+        self.y_default_params = self._parse_params(
+            raw.get('y_default_params', ''), [(0, 0)])
+
+        # plot_format
+        if 'plot_format' in raw:
+            v = raw['plot_format'].upper()
+            if v in self._VALID_FORMATS:
+                self.plot_format = v
+
+        # z0
+        if 'z0' in raw:
+            try:
+                v = float(raw['z0'])
+                if 0.1 <= v <= 10000.0:
+                    self.z0 = v
+            except ValueError:
+                pass
+
+        # font / graph settings
+        if 'font_family' in raw:
+            self.font_family = raw['font_family']
+        for _key, _attr, _lo, _hi in [
+            ('font_size',   'font_size',   4, 32),
+            ('label_size',  'label_size',  4, 32),
+            ('title_size',  'title_size',  4, 32),
+            ('tick_size',   'tick_size',   4, 24),
+            ('legend_size', 'legend_size', 4, 24),
+        ]:
+            if _key in raw:
+                try:
+                    v = int(raw[_key])
+                    if _lo <= v <= _hi:
+                        setattr(self, _attr, v)
+                except ValueError:
+                    pass
+
+    @staticmethod
+    def _parse_params(value: str, default: list) -> list:
+        """Parse a param list like '11, 21' into [(0,0),(1,0)].
+
+        Special tokens:
+          'all'  -> sentinel meaning "check everything"
+          'none' -> empty list
+        """
+        v = value.strip().lower()
+        if not v:
+            return default
+        if v == 'none':
+            return []
+        if v == 'all':
+            return None  # None = "all available"
+
+        result = []
+        for token in v.split(','):
+            token = token.strip()
+            if len(token) == 2 and token.isdigit():
+                m = int(token[0]) - 1
+                n = int(token[1]) - 1
+                if m >= 0 and n >= 0:
+                    result.append((m, n))
+        return result if result else default
+
+
+# Module-level singleton — loaded once at import time
+settings = AppSettings()
+
+
+# ---------------------------------------------------------------------------
 # Nature Journal Color Palette
 # ---------------------------------------------------------------------------
 
@@ -90,6 +265,10 @@ class NatureColors:
 
     CYCLE = [RED, BLUE, GREEN, CYAN, SALMON, SLATE, MINT, DARK_RED, BROWN, TAN]
 
+    # Line-style cycle — advances once per full colour cycle so traces
+    # are distinguished first by colour, then by dash pattern.
+    LINESTYLES = ['-', '--', '-.', ':']
+
     # UI colors
     BG_LIGHT = '#FAFAFA'
     BG_SIDEBAR = '#F0F0F0'
@@ -102,30 +281,44 @@ class NatureColors:
         return NatureColors.CYCLE[index % len(NatureColors.CYCLE)]
 
     @staticmethod
+    def get_linestyle(file_idx: int) -> str:
+        """Return a line style that advances once per file.
+
+        All parameters from the same file share the same dash pattern so
+        files are immediately visually distinguishable even with just 2-3
+        files loaded.  Colors still cycle across individual traces.
+        """
+        return NatureColors.LINESTYLES[file_idx % len(NatureColors.LINESTYLES)]
+
+    @staticmethod
     def apply_matplotlib_defaults():
-        """Set matplotlib rcParams for Nature-style plots."""
+        """Set matplotlib rcParams for Nature-style plots.
+
+        Font and size values are read from the AppSettings singleton so
+        they can be tuned via snpviewer.conf without touching this file.
+        """
         plt.rcParams.update({
-            'font.family': 'sans-serif',
+            'font.family': settings.font_family,
             'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
-            'font.size': 10,
-            'axes.labelsize': 11,
-            'axes.titlesize': 12,
+            'font.size': settings.font_size,
+            'axes.labelsize': settings.label_size,
+            'axes.titlesize': settings.title_size,
             'axes.titleweight': 'bold',
             'axes.linewidth': 0.8,
             'axes.edgecolor': '#333333',
-            'xtick.labelsize': 9,
-            'ytick.labelsize': 9,
+            'xtick.labelsize': settings.tick_size,
+            'ytick.labelsize': settings.tick_size,
             'xtick.direction': 'in',
             'ytick.direction': 'in',
             'xtick.major.size': 4,
             'ytick.major.size': 4,
-            'legend.fontsize': 9,
+            'legend.fontsize': settings.legend_size,
             'legend.framealpha': 0.9,
             'legend.edgecolor': '#cccccc',
             'figure.facecolor': 'white',
-            'axes.facecolor': 'white',
-            'axes.grid': True,
-            'grid.alpha': 0.2,
+            'axes.facecolor': '#F5F5F5',
+            'axes.grid': False,
+            'grid.alpha': 0.0,
             'grid.linestyle': '-',
             'grid.color': '#cccccc',
             'lines.linewidth': 1.8,
@@ -145,11 +338,18 @@ class PlotCanvas(FigureCanvasQTAgg):
         super().__init__(self.fig)
         self.setParent(parent)
         self.ax = None
+        self._hover_ann = None          # annotation shown on mouse-over
+        self.mpl_connect('motion_notify_event', self._on_hover)
         self._show_placeholder()
+
+    def _clear_fig(self):
+        """Clear the figure and reset all transient per-plot state."""
+        self.fig.clear()
+        self._hover_ann = None          # old annotation is gone with the axes
 
     def _show_placeholder(self):
         """Show a placeholder message when no data is loaded."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
         self.ax.text(
             0.5, 0.5, 'Load an SNP file to begin',
@@ -168,13 +368,46 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.spines['top'].set_visible(False)
         self.ax.spines['right'].set_visible(False)
         self.ax.legend(loc='best', frameon=True)
-        self.ax.grid(True, alpha=0.2, linestyle='-', color='#cccccc')
+        self.ax.set_facecolor('#F5F5F5')
+        self.ax.grid(False)
 
-    def plot_magnitude(self, networks, param_list):
+    # ------------------------------------------------------------------
+    # Math Memory support
+    # ------------------------------------------------------------------
+
+    def _interp_to_freq(self, ref_network, target_network, ref_data_key):
+        """Interpolate ref_network's complex data onto target_network's
+        frequency grid.  ref_data_key is 's', 'z', or 'y'.
+
+        Returns a complex array shaped [len(target_freq), n_ports, n_ports]
+        or None if interpolation is impossible.
+        """
+        ref_f = ref_network.frequency.f
+        tgt_f = target_network.frequency.f
+        ref_data = getattr(ref_network, ref_data_key)   # complex 3-D array
+
+        n_ports_ref = ref_network.number_of_ports
+        n_ports_tgt = target_network.number_of_ports
+        n_ports = min(n_ports_ref, n_ports_tgt)
+
+        out = np.zeros((len(tgt_f), n_ports, n_ports), dtype=complex)
+        for m in range(n_ports):
+            for n in range(n_ports):
+                raw = ref_data[:, m, n]
+                out[:, m, n] = (
+                    np.interp(tgt_f, ref_f, raw.real) +
+                    1j * np.interp(tgt_f, ref_f, raw.imag)
+                )
+        return out
+
+    def plot_magnitude(self, networks, param_list,
+                       mem_network=None, diff_only=False):
         """Plot S-parameters in dB for multiple networks.
         networks: list of (short_name, Network) tuples.
+        mem_network: optional (name, Network) memory reference tuple.
+        diff_only: if True, plot only differential traces (not raw traces).
         """
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -186,29 +419,77 @@ class PlotCanvas(FigureCanvasQTAgg):
         # Determine best unit from the first network's raw Hz values
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        # Pre-compute memory reference data if set
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        # Plot memory reference trace (always shown when memory is set)
+        if mem_net is not None:
+            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            n_ports_m = mem_net.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports_m or n >= n_ports_m:
+                    continue
+                s_mag = np.abs(mem_net.s[:, m, n])
+                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
+                lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                self.ax.plot(freq_m, s_db,
+                             color='#AAAAAA', linewidth=1.4,
+                             linestyle='--', label=lbl, alpha=0.75)
+
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
+            is_mem_self = (network is mem_net)
+
+            # Compute interpolated memory data for this network (if set),
+            # but not when this network IS the memory (would be self - self = 0)
+            mem_interp = None
+            if mem_net is not None and not is_mem_self:
+                mem_interp = self._interp_to_freq(mem_net, network, 's')
+
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                s_mag = np.abs(network.s[:, m, n])
+                linestyle = NatureColors.get_linestyle(file_idx)
+
+                # Raw trace
+                s_raw = network.s[:, m, n]
+                s_mag = np.abs(s_raw)
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
-                label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
-                self.ax.plot(freq, s_db, color=color,
-                             label=label, linewidth=1.8)
+
+                if not diff_only:
+                    label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                    self.ax.plot(freq, s_db, color=color,
+                                 label=label, linewidth=1.8,
+                                 linestyle=linestyle)
+
+                # Differential trace (skip when this network is the memory itself)
+                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
+                    diff_raw = s_raw - mem_interp[:, m, n]
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
+                    diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
+                                else f'\u0394S{m+1},{n+1}')
+                    self.ax.plot(freq, diff_db, color=color,
+                                 label=diff_lbl, linewidth=1.8,
+                                 linestyle=':', alpha=0.9)
+
                 trace_idx += 1
 
+        title = 'Magnitude'
+        if mem_net is not None:
+            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Magnitude (dB)')
-        self._style_axes('Magnitude')
-        self.fig.tight_layout()
+        self._style_axes(title)
         self.draw()
 
-    def plot_phase(self, networks, param_list):
-        """Plot S-parameters phase in degrees for multiple networks."""
-        self.fig.clear()
+    def plot_z_magnitude(self, networks, param_list,
+                         mem_network=None, diff_only=False):
+        """Plot Z-parameters magnitude (dB) for multiple networks."""
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -219,28 +500,194 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        if mem_net is not None:
+            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            n_ports_m = mem_net.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports_m or n >= n_ports_m:
+                    continue
+                z_mag = np.abs(mem_net.z[:, m, n])
+                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
+                lbl = f'MEM {mem_name} Z{m+1},{n+1}' if multi else f'MEM Z{m+1},{n+1}'
+                self.ax.plot(freq_m, z_db,
+                             color='#AAAAAA', linewidth=1.4,
+                             linestyle='--', label=lbl, alpha=0.75)
+
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
+            mem_interp = None
+            if mem_net is not None and network is not mem_net:
+                mem_interp = self._interp_to_freq(mem_net, network, 'z')
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                s_deg = network.s_deg[:, m, n]
-                label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
-                self.ax.plot(freq, s_deg, color=color,
-                             label=label, linewidth=1.8)
+                linestyle = NatureColors.get_linestyle(file_idx)
+                z_raw = network.z[:, m, n]
+                z_mag = np.abs(z_raw)
+                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
+                if not diff_only:
+                    label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
+                    self.ax.plot(freq, z_db, color=color,
+                                 label=label, linewidth=1.8,
+                                 linestyle=linestyle)
+                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
+                    diff_raw = z_raw - mem_interp[:, m, n]
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
+                    diff_lbl = (f'\u0394{name} Z{m+1},{n+1}' if multi
+                                else f'\u0394Z{m+1},{n+1}')
+                    self.ax.plot(freq, diff_db, color=color,
+                                 label=diff_lbl, linewidth=1.8,
+                                 linestyle=':', alpha=0.9)
                 trace_idx += 1
 
+        title = 'Z-Parameters (Magnitude)'
+        if mem_net is not None:
+            title += ' (Math Memory active)'
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel('|Z| (dB\u03A9)')
+        self._style_axes(title)
+        self.draw()
+
+    def plot_y_magnitude(self, networks, param_list,
+                         mem_network=None, diff_only=False):
+        """Plot Y-parameters magnitude (dB) for multiple networks."""
+        self._clear_fig()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        trace_idx = 0
+        multi = len(networks) > 1
+        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
+
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        if mem_net is not None:
+            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            n_ports_m = mem_net.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports_m or n >= n_ports_m:
+                    continue
+                y_mag = np.abs(mem_net.y[:, m, n])
+                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
+                lbl = f'MEM {mem_name} Y{m+1},{n+1}' if multi else f'MEM Y{m+1},{n+1}'
+                self.ax.plot(freq_m, y_db,
+                             color='#AAAAAA', linewidth=1.4,
+                             linestyle='--', label=lbl, alpha=0.75)
+
+        for file_idx, (name, network) in enumerate(networks):
+            freq, _ = auto_freq_scale(network.frequency.f)
+            n_ports = network.number_of_ports
+            mem_interp = None
+            if mem_net is not None and network is not mem_net:
+                mem_interp = self._interp_to_freq(mem_net, network, 'y')
+            for m, n in param_list:
+                if m >= n_ports or n >= n_ports:
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                linestyle = NatureColors.get_linestyle(file_idx)
+                y_raw = network.y[:, m, n]
+                y_mag = np.abs(y_raw)
+                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
+                if not diff_only:
+                    label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
+                    self.ax.plot(freq, y_db, color=color,
+                                 label=label, linewidth=1.8,
+                                 linestyle=linestyle)
+                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
+                    diff_raw = y_raw - mem_interp[:, m, n]
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
+                    diff_lbl = (f'\u0394{name} Y{m+1},{n+1}' if multi
+                                else f'\u0394Y{m+1},{n+1}')
+                    self.ax.plot(freq, diff_db, color=color,
+                                 label=diff_lbl, linewidth=1.8,
+                                 linestyle=':', alpha=0.9)
+                trace_idx += 1
+
+        title = 'Y-Parameters (Magnitude)'
+        if mem_net is not None:
+            title += ' (Math Memory active)'
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel('|Y| (dBS)')
+        self._style_axes(title)
+        self.draw()
+
+    def plot_phase(self, networks, param_list,
+                   mem_network=None, diff_only=False):
+        """Plot S-parameters phase in degrees for multiple networks."""
+        self._clear_fig()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        trace_idx = 0
+        multi = len(networks) > 1
+        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
+
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        if mem_net is not None:
+            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            n_ports_m = mem_net.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports_m or n >= n_ports_m:
+                    continue
+                lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                self.ax.plot(freq_m, mem_net.s_deg[:, m, n],
+                             color='#AAAAAA', linewidth=1.4,
+                             linestyle='--', label=lbl, alpha=0.75)
+
+        for file_idx, (name, network) in enumerate(networks):
+            freq, _ = auto_freq_scale(network.frequency.f)
+            n_ports = network.number_of_ports
+            mem_interp = None
+            if mem_net is not None and network is not mem_net:
+                mem_interp = self._interp_to_freq(mem_net, network, 's')
+            for m, n in param_list:
+                if m >= n_ports or n >= n_ports:
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                linestyle = NatureColors.get_linestyle(file_idx)
+                s_deg = network.s_deg[:, m, n]
+                if not diff_only:
+                    label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                    self.ax.plot(freq, s_deg, color=color,
+                                 label=label, linewidth=1.8,
+                                 linestyle=linestyle)
+                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
+                    mem_deg = np.degrees(np.angle(mem_interp[:, m, n]))
+                    diff_deg = s_deg - mem_deg
+                    diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
+                                else f'\u0394S{m+1},{n+1}')
+                    self.ax.plot(freq, diff_deg, color=color,
+                                 label=diff_lbl, linewidth=1.8,
+                                 linestyle=':', alpha=0.9)
+                trace_idx += 1
+
+        title = 'Phase'
+        if mem_net is not None:
+            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Phase (degrees)')
-        self._style_axes('Phase')
-        self.fig.tight_layout()
+        self._style_axes(title)
         self.draw()
 
     def plot_smith(self, networks, param_list):
         """Plot S-parameters on a Smith chart for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -268,12 +715,11 @@ class PlotCanvas(FigureCanvasQTAgg):
 
         self.ax.set_title('Smith Chart', pad=10, fontsize=12, fontweight='bold')
         self.ax.legend(loc='upper right', frameon=True)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_vswr(self, networks, param_list):
         """Plot VSWR for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -284,7 +730,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
             for m, n in param_list:
@@ -298,19 +744,20 @@ class PlotCanvas(FigureCanvasQTAgg):
                 vswr = np.clip(vswr, 1, 100)
                 label = f'{name} VSWR(S{m+1},{n+1})' if multi else f'VSWR(S{m+1},{n+1})'
                 self.ax.plot(freq, vswr, color=color,
-                             label=label, linewidth=1.8)
+                             label=label, linewidth=1.8,
+                             linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('VSWR')
         self.ax.set_ylim(bottom=1)
         self._style_axes('VSWR')
-        self.fig.tight_layout()
         self.draw()
 
-    def plot_group_delay(self, networks, param_list):
+    def plot_group_delay(self, networks, param_list,
+                         mem_network=None, diff_only=False):
         """Plot group delay for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -321,26 +768,67 @@ class PlotCanvas(FigureCanvasQTAgg):
         multi = len(networks) > 1
         _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
 
-        for name, network in networks:
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        def _group_delay_ns(network, m, n):
+            s_phase_rad = np.unwrap(np.angle(network.s[:, m, n]))
+            omega = 2 * np.pi * network.frequency.f
+            if len(omega) > 1:
+                return -np.gradient(s_phase_rad, omega) * 1e9
+            return None
+
+        if mem_net is not None:
+            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            n_ports_m = mem_net.number_of_ports
+            for m, n in param_list:
+                if m >= n_ports_m or n >= n_ports_m:
+                    continue
+                gd = _group_delay_ns(mem_net, m, n)
+                if gd is not None:
+                    lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                    self.ax.plot(freq_m, gd,
+                                 color='#AAAAAA', linewidth=1.4,
+                                 linestyle='--', label=lbl, alpha=0.75)
+
+        for file_idx, (name, network) in enumerate(networks):
             freq, _ = auto_freq_scale(network.frequency.f)
             n_ports = network.number_of_ports
+            mem_interp = None
+            if mem_net is not None and network is not mem_net:
+                mem_interp = self._interp_to_freq(mem_net, network, 's')
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                s_phase_rad = np.unwrap(np.angle(network.s[:, m, n]))
-                omega = 2 * np.pi * network.frequency.f
-                if len(omega) > 1:
-                    group_delay = -np.gradient(s_phase_rad, omega)
-                    label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
-                    self.ax.plot(freq, group_delay * 1e9, color=color,
-                                 label=label, linewidth=1.8)
+                linestyle = NatureColors.get_linestyle(file_idx)
+                gd = _group_delay_ns(network, m, n)
+                if gd is not None:
+                    if not diff_only:
+                        label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                        self.ax.plot(freq, gd, color=color,
+                                     label=label, linewidth=1.8,
+                                     linestyle=linestyle)
+                    if (mem_interp is not None
+                            and m < mem_interp.shape[1]
+                            and n < mem_interp.shape[2]):
+                        # Reconstruct a temporary network-like object for mem GD
+                        mem_phase_rad = np.unwrap(np.angle(mem_interp[:, m, n]))
+                        omega = 2 * np.pi * network.frequency.f
+                        mem_gd = -np.gradient(mem_phase_rad, omega) * 1e9
+                        diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
+                                    else f'\u0394S{m+1},{n+1}')
+                        self.ax.plot(freq, gd - mem_gd, color=color,
+                                     label=diff_lbl, linewidth=1.8,
+                                     linestyle=':', alpha=0.9)
                 trace_idx += 1
 
+        title = 'Group Delay'
+        if mem_net is not None:
+            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Group Delay (ns)')
-        self._style_axes('Group Delay')
-        self.fig.tight_layout()
+        self._style_axes(title)
         self.draw()
 
     def _show_no_params(self):
@@ -407,6 +895,34 @@ class PlotCanvas(FigureCanvasQTAgg):
             if unit in xlabel:
                 return unit
         return ''
+
+    @staticmethod
+    def _axis_unit_to_hz(unit):
+        """Return the multiplier to convert a value in *unit* to Hz."""
+        return {'THz': 1e12, 'GHz': 1e9, 'MHz': 1e6, 'kHz': 1e3, 'Hz': 1}.get(unit, 1)
+
+    @staticmethod
+    def _format_bw(bw_axis, axis_unit):
+        """Format a bandwidth value in the best engineering unit.
+
+        *bw_axis* is in *axis_unit* (e.g. MHz).  Returns a string like
+        '593.4 kHz' or '1.23 MHz', choosing whichever prefix avoids tiny
+        or huge numbers.
+        """
+        hz = bw_axis * PlotCanvas._axis_unit_to_hz(axis_unit)
+        for prefix, scale in (('THz', 1e12), ('GHz', 1e9), ('MHz', 1e6),
+                               ('kHz', 1e3), ('Hz', 1)):
+            if abs(hz) >= scale:
+                val = hz / scale
+                # Choose decimal places so we get 3–4 significant figures
+                if val >= 100:
+                    fmt = f"{val:.1f}"
+                elif val >= 10:
+                    fmt = f"{val:.2f}"
+                else:
+                    fmt = f"{val:.3f}"
+                return f"{fmt} {prefix}"
+        return f"{hz:.4g} Hz"
 
     def _compute_q_one_trace(self, xdata, ydata, xmin, xmax):
         """Compute Q for a single (xdata, ydata) trace within [xmin, xmax].
@@ -514,7 +1030,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         text_lines = []
         for r in results:
             f0_str = f"{r['f0']:.6g}"
-            bw_str = f"{r['bw']:.6g}"
+            bw_str = self._format_bw(r['bw'], f_unit)
             q_str  = f"{r['q']:.0f}"
             lbl = r['label']
             if lbl and not lbl.startswith('_'):
@@ -525,7 +1041,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             if header:
                 text_lines.append(header)
             text_lines.append(
-                f"f0 = {f0_str} {f_unit}   BW = {bw_str} {f_unit}   Q = {q_str}"
+                f"f0 = {f0_str} {f_unit}   BW = {bw_str}   Q = {q_str}"
             )
 
         txt = '\n'.join(text_lines)
@@ -592,6 +1108,210 @@ class PlotCanvas(FigureCanvasQTAgg):
                 except Exception:
                     pass
         self._q_annotations = []
+
+    # ------------------------------------------------------------------
+    # Change detection on differential (math memory) traces
+    # ------------------------------------------------------------------
+
+    def find_and_annotate_changes(self, prominence_db=6.0):
+        """Detect significant changes in all differential (Δ) traces currently
+        plotted and annotate them.
+
+        Algorithm per trace:
+          1. Noise floor = median of the diff_db values (robust baseline).
+          2. Threshold  = noise_floor + prominence_db  (above the median).
+          3. find_peaks on the diff_db with prominence >= prominence_db
+             to locate local maxima that stand clearly above the noise.
+          4. Shade each contiguous above-threshold region as a translucent span.
+          5. Mark each peak with a triangle + frequency label.
+
+        Only lines whose label starts with 'Δ' are processed.
+        Returns the number of peaks found across all traces.
+        """
+        if self.ax is None:
+            return 0
+
+        self._clear_change_annotations()
+        self._change_annotations = []
+
+        f_unit = self._get_freq_unit()
+        total_peaks = 0
+
+        for ln in self.ax.lines:
+            lbl = ln.get_label() or ''
+            if not lbl.startswith('\u0394'):   # only Δ traces
+                continue
+
+            xdata = np.asarray(ln.get_xdata(), dtype=float)
+            ydata = np.asarray(ln.get_ydata(), dtype=float)
+
+            if len(xdata) < 5:
+                continue
+
+            # --- noise floor & threshold ---
+            noise_floor = np.median(ydata)
+            prominence_req = prominence_db
+            threshold = noise_floor + prominence_req
+
+            # --- find peaks above threshold with sufficient prominence ---
+            peaks, props = find_peaks(
+                ydata,
+                height=threshold,
+                prominence=prominence_req,
+            )
+
+            if len(peaks) == 0:
+                continue
+
+            color = ln.get_color()
+
+            # --- shade contiguous above-threshold regions ---
+            above = ydata >= threshold
+            # find run starts / ends
+            padded = np.concatenate(([False], above, [False]))
+            diff_mask = np.diff(padded.astype(int))
+            starts = np.where(diff_mask == 1)[0]
+            ends   = np.where(diff_mask == -1)[0]
+
+            for s, e in zip(starts, ends):
+                x0 = xdata[s]
+                x1 = xdata[min(e, len(xdata) - 1)]
+                span = self.ax.axvspan(
+                    x0, x1,
+                    alpha=0.18, color=color, linewidth=0,
+                    zorder=1,
+                )
+                self._change_annotations.append(span)
+
+            # --- mark each peak ---
+            for pk in peaks:
+                fx = xdata[pk]
+                fy = ydata[pk]
+                marker = self.ax.plot(
+                    fx, fy, marker='v', markersize=8,
+                    color=color, alpha=0.9,
+                    linestyle='none', zorder=5,
+                )
+                self._change_annotations.extend(marker)
+
+                txt = self.ax.annotate(
+                    f'{fx:.5g} {f_unit}',
+                    xy=(fx, fy),
+                    xytext=(4, 10),          # 4 pt right, 10 pt above marker
+                    textcoords='offset points',
+                    fontsize=7.5, color=color,
+                    va='bottom', ha='left',
+                    rotation=90,
+                    zorder=6,
+                )
+                self._change_annotations.append(txt)
+
+            total_peaks += len(peaks)
+
+        self.draw()
+        return total_peaks
+
+    def _clear_change_annotations(self):
+        """Remove any existing change-detection annotation artists."""
+        if hasattr(self, '_change_annotations'):
+            for artist in self._change_annotations:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        self._change_annotations = []
+
+    # ------------------------------------------------------------------
+    # Hover tooltip
+    # ------------------------------------------------------------------
+
+    def _on_hover(self, event):
+        """Show a data-point tooltip when the cursor is near a plotted line."""
+        if self.ax is None or event.inaxes != self.ax:
+            self._hide_hover()
+            return
+
+        PIXEL_THRESH = 20           # snap radius in screen pixels
+        best_dist = PIXEL_THRESH + 1
+        best_x = best_y = best_label = best_color = None
+
+        xmin, xmax = self.ax.get_xlim()
+
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if xd is None or len(xd) <= 2:
+                continue                     # skip axhline / axvline markers
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue                     # skip internal matplotlib lines
+
+            xd = np.asarray(xd, dtype=float)
+            yd = np.asarray(yd, dtype=float)
+
+            # Restrict to the currently visible x-range for speed
+            vis = (xd >= xmin) & (xd <= xmax)
+            if not vis.any():
+                continue
+            xd_v, yd_v = xd[vis], yd[vis]
+
+            # Convert data coords → display (pixel) coords, measure distance
+            pts = self.ax.transData.transform(np.column_stack([xd_v, yd_v]))
+            dists = np.hypot(pts[:, 0] - event.x, pts[:, 1] - event.y)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist:
+                best_dist = dists[idx]
+                best_x    = xd_v[idx]
+                best_y    = yd_v[idx]
+                best_label = lbl
+                best_color = ln.get_color()
+
+        if best_x is None:
+            self._hide_hover()
+            return
+
+        # Build tooltip text
+        f_unit = self._get_freq_unit()
+        if f_unit:                           # frequency-based plot
+            text = f'{best_x:.5g} {f_unit}\n{best_y:.4g}'
+        else:                               # Smith chart — show Re / Im
+            text = f'Re: {best_x:.4g}\nIm: {best_y:.4g}'
+        if best_label and not best_label.startswith('_'):
+            text = f'{best_label}\n' + text
+
+        self._show_hover(best_x, best_y, text, best_color or '#555555')
+
+    def _show_hover(self, x, y, text, color):
+        """Create or update the hover annotation at data point (x, y)."""
+        if self._hover_ann is None:
+            self._hover_ann = self.ax.annotate(
+                text,
+                xy=(x, y),
+                xytext=(12, 12),
+                textcoords='offset points',
+                fontsize=8,
+                family='monospace',
+                bbox=dict(
+                    boxstyle='round,pad=0.4',
+                    facecolor='lightyellow',
+                    edgecolor=color,
+                    alpha=0.93,
+                    linewidth=1.2,
+                ),
+                zorder=20,
+            )
+        else:
+            self._hover_ann.set_text(text)
+            self._hover_ann.xy = (x, y)
+            self._hover_ann.get_bbox_patch().set_edgecolor(color)
+            self._hover_ann.set_visible(True)
+        self.draw_idle()
+
+    def _hide_hover(self):
+        """Hide the hover annotation without destroying it."""
+        if self._hover_ann is not None and self._hover_ann.get_visible():
+            self._hover_ann.set_visible(False)
+            self.draw_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -700,15 +1420,16 @@ class FileListWidget(QListWidget):
 # ---------------------------------------------------------------------------
 
 class ParameterSelector(QGroupBox):
-    """Dynamic checkbox grid for S-parameter selection."""
+    """Dynamic checkbox grid for S/Z/Y-parameter selection."""
 
     selection_changed = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("S-Parameters", parent)
+        super().__init__("Parameters", parent)
         self._checkboxes = []
         self._layout = QGridLayout()
         self._layout.setSpacing(2)
+        self._param_type = 'S'   # 'S', 'Z', or 'Y'
         self.setLayout(self._layout)
         self.setStyleSheet("""
             QGroupBox {
@@ -729,6 +1450,17 @@ class ParameterSelector(QGroupBox):
                 spacing: 3px;
             }
         """)
+
+    def set_param_type(self, param_type):
+        """Switch the displayed parameter type ('S', 'Z', or 'Y') and
+        relabel existing checkboxes without resetting their checked state."""
+        self._param_type = param_type.upper()
+        self.setTitle(f'{self._param_type}-Parameters')
+        p = self._param_type
+        for cb in self._checkboxes:
+            m = cb.property('row')
+            n = cb.property('col')
+            cb.setText(f'{p}{m + 1},{n + 1}')
 
     def update_for_networks(self, networks):
         """Rebuild checkboxes for the union of ports across all networks.
@@ -752,23 +1484,27 @@ class ParameterSelector(QGroupBox):
 
         # Use the max port count across all selected networks
         max_ports = max(net.number_of_ports for _, net in networks)
+        p = self._param_type
 
         for m in range(max_ports):
             for n in range(max_ports):
-                cb = QCheckBox(f'S{m + 1},{n + 1}')
+                cb = QCheckBox(f'{p}{m + 1},{n + 1}')
                 cb.setProperty('row', m)
                 cb.setProperty('col', n)
-                # Restore previous state, or use defaults on first build
+                # Restore previous state, or use settings defaults on first build
                 if prev_checked:
                     cb.setChecked((m, n) in prev_checked)
                 else:
-                    if (m, n) == (0, 0):
+                    default = settings.default_params_for(self._param_type)
+                    if default is None:  # 'all' sentinel
                         cb.setChecked(True)
-                    elif max_ports >= 2 and (m, n) == (1, 0):
-                        cb.setChecked(True)
+                    else:
+                        cb.setChecked((m, n) in default)
                 cb.stateChanged.connect(self._on_changed)
                 self._layout.addWidget(cb, m, n)
                 self._checkboxes.append(cb)
+
+        self.setTitle(f'{p}-Parameters')
 
     def get_selected_params(self):
         """Return list of (m, n) tuples for checked parameters."""
@@ -927,8 +1663,6 @@ class ConversionPanel(QGroupBox):
 
     def _write_converted(self, network, filepath, param, form, z0):
         """Write network with parameter conversion."""
-        # scikit-rf supports writing with different parameter types
-        # through the Touchstone file format
         freq = network.frequency
 
         if param == 'z':
@@ -941,31 +1675,28 @@ class ConversionPanel(QGroupBox):
         n_ports = network.number_of_ports
 
         with open(filepath, 'w') as f:
-            # Write header
             freq_unit = freq.unit.upper()
-            if freq_unit == 'HZ':
-                freq_unit = 'HZ'
             f.write(f"! Converted by SNP Viewer\n")
             f.write(f"# {freq_unit} {param.upper()} {form.upper()} R {z0}\n")
 
-            for k in range(len(freq.f)):
-                line = f"{freq.f[k]:.10g}"
-                for m in range(n_ports):
-                    for n in range(n_ports):
-                        val = data[k, m, n]
-                        if form == 'ri':
-                            line += f"  {val.real:.10g}  {val.imag:.10g}"
-                        elif form == 'ma':
-                            mag = np.abs(val)
-                            ang = np.degrees(np.angle(val))
-                            line += f"  {mag:.10g}  {ang:.10g}"
-                        elif form == 'db':
-                            mag_db = 20 * np.log10(np.abs(val) + 1e-30)
-                            ang = np.degrees(np.angle(val))
-                            line += f"  {mag_db:.10g}  {ang:.10g}"
-                        else:
-                            line += f"  {val.real:.10g}  {val.imag:.10g}"
-                f.write(line + "\n")
+            # Build a 2-D matrix [N_freq × (1 + 2*n_ports²)] then write
+            # in one C-level pass with np.savetxt — much faster than a
+            # Python loop over frequency points.
+            cols = [freq.f]
+            for m in range(n_ports):
+                for n in range(n_ports):
+                    val = data[:, m, n]
+                    if form == 'ri':
+                        cols.append(val.real)
+                        cols.append(val.imag)
+                    elif form == 'ma':
+                        cols.append(np.abs(val))
+                        cols.append(np.degrees(np.angle(val)))
+                    else:  # db
+                        cols.append(20 * np.log10(np.abs(val) + 1e-30))
+                        cols.append(np.degrees(np.angle(val)))
+
+            np.savetxt(f, np.column_stack(cols), fmt='%.10g')
 
 
 # ---------------------------------------------------------------------------
@@ -981,11 +1712,20 @@ class SNPViewerApp(QMainWindow):
     PLOT_VSWR = 3
     PLOT_GROUP_DELAY = 4
 
+    # Parameter types that show a magnitude (dB) plot and support Q measurement
+    _MAGNITUDE_PLOTS = {PLOT_MAGNITUDE}
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SNP Viewer")
         self.resize(1200, 750)
         self.setAcceptDrops(True)
+
+        self._param_type = settings.param_type   # 'S', 'Z', or 'Y'
+
+        # Math Memory state
+        self._mem_network = None   # (short_name, Network) or None
+        self._diff_only = False    # Show differential traces only
 
         NatureColors.apply_matplotlib_defaults()
         self._build_ui()
@@ -1065,6 +1805,7 @@ class SNPViewerApp(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setMaximumHeight(180)
         self.param_selector = ParameterSelector()
+        self.param_selector.set_param_type(self._param_type)
         scroll.setWidget(self.param_selector)
         sidebar_layout.addWidget(scroll)
 
@@ -1077,6 +1818,15 @@ class SNPViewerApp(QMainWindow):
         # Conversion panel
         self.conversion_panel = ConversionPanel()
         sidebar_layout.addWidget(self.conversion_panel)
+
+        # Apply settings to conversion panel defaults
+        fmt_idx = self.conversion_panel.format_combo.findText(settings.plot_format)
+        if fmt_idx >= 0:
+            self.conversion_panel.format_combo.setCurrentIndex(fmt_idx)
+        self.conversion_panel.z0_spin.setValue(settings.z0)
+        param_idx = self.conversion_panel.param_combo.findText(self._param_type)
+        if param_idx >= 0:
+            self.conversion_panel.param_combo.setCurrentIndex(param_idx)
 
         sidebar_layout.addStretch()
 
@@ -1163,6 +1913,10 @@ class SNPViewerApp(QMainWindow):
         file_menu.addAction(exit_action)
 
         help_menu = menubar.addMenu("&Help")
+        settings_action = QAction("&Settings Info...", self)
+        settings_action.triggered.connect(self._show_settings_info)
+        help_menu.addAction(settings_action)
+        help_menu.addSeparator()
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1200,6 +1954,49 @@ class SNPViewerApp(QMainWindow):
 
         toolbar.addSeparator()
 
+        # S / Z / Y parameter-type toggle buttons
+        _param_btn_style = """
+            QToolButton {{
+                font-size: 9pt;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 3px;
+                border: 1px solid #B0B0B0;
+                background: #F0F0F0;
+                color: #333;
+            }}
+            QToolButton:checked {{
+                background: {active_bg};
+                color: white;
+                border: 1px solid {active_bg};
+            }}
+            QToolButton:hover:!checked {{
+                background: #E0E0E0;
+            }}
+        """
+        self.s_action = QAction("S", self)
+        self.s_action.setCheckable(True)
+        self.s_action.setChecked(self._param_type == 'S')
+        self.s_action.setToolTip("Display S-parameters")
+        self.s_action.triggered.connect(lambda: self._on_param_type_changed('S'))
+        toolbar.addAction(self.s_action)
+
+        self.z_action = QAction("Z", self)
+        self.z_action.setCheckable(True)
+        self.z_action.setChecked(self._param_type == 'Z')
+        self.z_action.setToolTip("Display Z-parameters (impedance)")
+        self.z_action.triggered.connect(lambda: self._on_param_type_changed('Z'))
+        toolbar.addAction(self.z_action)
+
+        self.y_action = QAction("Y", self)
+        self.y_action.setCheckable(True)
+        self.y_action.setChecked(self._param_type == 'Y')
+        self.y_action.setToolTip("Display Y-parameters (admittance)")
+        self.y_action.triggered.connect(lambda: self._on_param_type_changed('Y'))
+        toolbar.addAction(self.y_action)
+
+        toolbar.addSeparator()
+
         self.q_action = QAction("Measure Q", self)
         self.q_action.setToolTip(
             "Drag a region around a peak to compute Q = f0 / (3 dB bandwidth)"
@@ -1214,6 +2011,50 @@ class SNPViewerApp(QMainWindow):
         self.clear_q_action.setEnabled(False)
         self.clear_q_action.triggered.connect(self._on_clear_q)
         toolbar.addAction(self.clear_q_action)
+
+        toolbar.addSeparator()
+
+        self.mem_action = QAction("Set Mem", self)
+        self.mem_action.setToolTip(
+            "Capture the first selected trace as the math memory reference.\n"
+            "Subsequent traces will show their difference from this reference."
+        )
+        self.mem_action.setEnabled(False)
+        self.mem_action.triggered.connect(self._on_set_mem)
+        toolbar.addAction(self.mem_action)
+
+        self.clr_mem_action = QAction("Clr Mem", self)
+        self.clr_mem_action.setToolTip("Clear the math memory reference")
+        self.clr_mem_action.setEnabled(False)
+        self.clr_mem_action.triggered.connect(self._on_clr_mem)
+        toolbar.addAction(self.clr_mem_action)
+
+        self.diff_only_action = QAction("Diff Only", self)
+        self.diff_only_action.setToolTip(
+            "Toggle: show only the differential (memory-subtracted) traces, "
+            "hiding the raw measurement traces"
+        )
+        self.diff_only_action.setCheckable(True)
+        self.diff_only_action.setChecked(False)
+        self.diff_only_action.setEnabled(False)
+        self.diff_only_action.triggered.connect(self._on_diff_only_toggled)
+        toolbar.addAction(self.diff_only_action)
+
+        self.find_changes_action = QAction("Find Changes", self)
+        self.find_changes_action.setToolTip(
+            "Auto-detect significant changes in the differential traces.\n"
+            "Uses noise-floor estimation + peak finding to mark regions\n"
+            "that deviate more than 6 dB above the median differential."
+        )
+        self.find_changes_action.setEnabled(False)
+        self.find_changes_action.triggered.connect(self._on_find_changes)
+        toolbar.addAction(self.find_changes_action)
+
+        self.clear_changes_action = QAction("Clear Changes", self)
+        self.clear_changes_action.setToolTip("Remove change-detection annotations")
+        self.clear_changes_action.setEnabled(False)
+        self.clear_changes_action.triggered.connect(self._on_clear_changes)
+        toolbar.addAction(self.clear_changes_action)
 
     def _connect_signals(self):
         """Wire up all signals and slots."""
@@ -1263,6 +2104,8 @@ class SNPViewerApp(QMainWindow):
         # Q button only active on magnitude tab when data is present
         on_magnitude = (self.plot_tab_bar.currentIndex() == self.PLOT_MAGNITUDE)
         self.q_action.setEnabled(on_magnitude and bool(networks))
+        # Math memory: "Set Mem" available whenever at least one file is selected
+        self.mem_action.setEnabled(bool(networks))
 
     def _on_remove(self):
         """Remove all selected files from the list."""
@@ -1275,6 +2118,7 @@ class SNPViewerApp(QMainWindow):
             self.q_action.setEnabled(False)
             self.q_action.setChecked(False)
             self.clear_q_action.setEnabled(False)
+            self.mem_action.setEnabled(False)
             self._update_status("No files loaded.")
 
     def _on_save(self):
@@ -1295,8 +2139,10 @@ class SNPViewerApp(QMainWindow):
             self.canvas._q_span.set_visible(False)
             self.canvas._q_span = None
         self.canvas._clear_q_annotations()
+        self.canvas._clear_change_annotations()
         self.q_action.setChecked(False)
         self.clear_q_action.setEnabled(False)
+        self.clear_changes_action.setEnabled(False)
 
         networks = self.file_list.get_selected_networks()
         if not networks:
@@ -1306,21 +2152,50 @@ class SNPViewerApp(QMainWindow):
         params = self.param_selector.get_selected_params()
         plot_type = self.plot_tab_bar.currentIndex()
 
+        # Math memory kwargs — only pass to plot types that support it
+        mem_kw = dict(mem_network=self._mem_network,
+                      diff_only=self._diff_only)
+
         if plot_type == self.PLOT_MAGNITUDE:
-            self.canvas.plot_magnitude(networks, params)
+            if self._param_type == 'Z':
+                self.canvas.plot_z_magnitude(networks, params, **mem_kw)
+            elif self._param_type == 'Y':
+                self.canvas.plot_y_magnitude(networks, params, **mem_kw)
+            else:
+                self.canvas.plot_magnitude(networks, params, **mem_kw)
         elif plot_type == self.PLOT_PHASE:
-            self.canvas.plot_phase(networks, params)
+            self.canvas.plot_phase(networks, params, **mem_kw)
         elif plot_type == self.PLOT_SMITH:
             self.canvas.plot_smith(networks, params)
         elif plot_type == self.PLOT_VSWR:
             self.canvas.plot_vswr(networks, params)
         elif plot_type == self.PLOT_GROUP_DELAY:
-            self.canvas.plot_group_delay(networks, params)
+            self.canvas.plot_group_delay(networks, params, **mem_kw)
+
+    def _on_param_type_changed(self, param_type):
+        """Switch between S, Z, and Y parameter display."""
+        self._param_type = param_type
+
+        # Keep the three toggle buttons mutually exclusive
+        self.s_action.setChecked(param_type == 'S')
+        self.z_action.setChecked(param_type == 'Z')
+        self.y_action.setChecked(param_type == 'Y')
+
+        # Relabel the parameter checkboxes
+        self.param_selector.set_param_type(param_type)
+
+        # Z/Y magnitude plots only make sense on the Magnitude tab;
+        # switch to it if we are not already there.
+        if self.plot_tab_bar.currentIndex() != self.PLOT_MAGNITUDE:
+            # Suppress duplicate replot — tab-change will trigger _replot
+            self.plot_tab_bar.setCurrentIndex(self.PLOT_MAGNITUDE)
+        else:
+            self._replot()
 
     def _on_tab_changed(self, index):
         """Handle plot-type tab change; replot and update Q button state."""
         self._replot()
-        # Q measurement only meaningful on the Magnitude (dB) tab
+        # Q measurement is meaningful on the Magnitude (dB) tab only
         on_magnitude = (index == self.PLOT_MAGNITUDE)
         networks = self.file_list.get_selected_networks()
         has_data = bool(networks)
@@ -1370,9 +2245,9 @@ class SNPViewerApp(QMainWindow):
             lbl = r['label']
             unit = r['f_unit']
             f0_str = f"{r['f0']:.6g}"
-            bw_str = f"{r['bw']:.6g}"
+            bw_str = self.canvas._format_bw(r['bw'], unit)
             q_str  = f"{r['q']:.0f}"
-            entry = f"f0={f0_str} {unit}  BW={bw_str} {unit}  Q={q_str}"
+            entry = f"f0={f0_str} {unit}  BW={bw_str}  Q={q_str}"
             if lbl and not lbl.startswith('_'):
                 entry = f"[{lbl}] " + entry
             parts.append(entry)
@@ -1384,6 +2259,78 @@ class SNPViewerApp(QMainWindow):
         self.canvas.draw()
         self.clear_q_action.setEnabled(False)
         self._update_status("Q annotations cleared.")
+
+    # --- Math Memory slots ---
+
+    def _on_set_mem(self):
+        """Capture the first selected network as the math memory reference."""
+        networks = self.file_list.get_selected_networks()
+        if not networks:
+            return
+        self._mem_network = networks[0]   # (short_name, Network)
+        name = self._mem_network[0]
+        self.clr_mem_action.setEnabled(True)
+        self.diff_only_action.setEnabled(True)
+        self.find_changes_action.setEnabled(True)
+        self._update_status(f"Math memory set to: {name}")
+        self._replot()
+
+    def _on_clr_mem(self):
+        """Clear the math memory reference."""
+        self._mem_network = None
+        self._diff_only = False
+        self.clr_mem_action.setEnabled(False)
+        self.diff_only_action.setEnabled(False)
+        self.diff_only_action.setChecked(False)
+        self.find_changes_action.setEnabled(False)
+        self.clear_changes_action.setEnabled(False)
+        self.canvas._clear_change_annotations()
+        self._update_status("Math memory cleared.")
+        self._replot()
+
+    def _on_diff_only_toggled(self, checked):
+        """Toggle differential-only display."""
+        self._diff_only = checked
+        self._replot()
+
+    def _on_find_changes(self):
+        """Run automatic change detection on the differential traces."""
+        default_prominence = getattr(self, '_last_prominence_db', 6.0)
+        prominence_db, ok = QInputDialog.getDouble(
+            self,
+            "Find Changes – Noise Floor",
+            "Minimum peak prominence above median (dB):\n"
+            "(Lower values detect smaller peaks; default is 6 dB)",
+            default_prominence,   # current value
+            0.1,                  # min
+            100.0,                # max
+            1,                    # decimals
+        )
+        if not ok:
+            return
+        self._last_prominence_db = prominence_db
+
+        n = self.canvas.find_and_annotate_changes(prominence_db=prominence_db)
+        if n == 0:
+            QMessageBox.information(
+                self, "Find Changes",
+                "No significant changes detected.\n"
+                f"No peaks exceed {prominence_db:.1f} dB above the median noise floor."
+            )
+            self._update_status("Find Changes: no significant peaks found.")
+        else:
+            self.clear_changes_action.setEnabled(True)
+            self._update_status(
+                f"Find Changes: {n} significant peak(s) marked "
+                f"(threshold {prominence_db:.1f} dB above median)."
+            )
+
+    def _on_clear_changes(self):
+        """Remove change-detection annotations."""
+        self.canvas._clear_change_annotations()
+        self.canvas.draw()
+        self.clear_changes_action.setEnabled(False)
+        self._update_status("Change annotations cleared.")
 
     def _update_selection_status(self, networks):
         """Update status bar with info about selected networks."""
@@ -1418,6 +2365,52 @@ class SNPViewerApp(QMainWindow):
             "of magnitude, phase, Smith chart, VSWR, and group delay.</p>"
             "<p>Uses Nature Journal color scheme.</p>"
             "<p>Built with PyQt5, matplotlib, and scikit-rf.</p>"
+            "<hr>"
+            "<p><b>Author:</b> Daniel Hedlund<br>"
+            "<b>Contact:</b> <a href='mailto:daniel.hedlund@gmail.com'>"
+            "daniel.hedlund@gmail.com</a></p>"
+            "<hr>"
+            "<p style='font-size: 8pt; color: #666;'>"
+            "<b>THE BEER-WARE LICENSE</b> (Revision 42):<br>"
+            "Daniel Hedlund wrote this file. As long as you retain this notice "
+            "you can do whatever you want with this stuff. If we meet some day, "
+            "and you think this stuff is worth it, you can buy me a beer in return."
+            "</p>"
+        )
+
+    def _show_settings_info(self):
+        """Show which settings file is active and its current values."""
+        conf_path = settings.conf_path()
+        if conf_path:
+            source = f"<p><b>Loaded from:</b><br><code>{conf_path}</code></p>"
+        else:
+            source = (
+                "<p><b>No settings file found.</b> Using built-in defaults.<br>"
+                "Create <code>snpviewer.conf</code> next to snpviewer.py "
+                "or <code>~/.snpviewer.conf</code> to customise defaults.</p>"
+            )
+
+        def fmt_params(lst):
+            if lst is None:
+                return "all"
+            if not lst:
+                return "none"
+            return ", ".join(f"{m+1}{n+1}" for m, n in lst)
+
+        QMessageBox.information(
+            self, "Settings",
+            f"{source}"
+            f"<table cellspacing='4'>"
+            f"<tr><td><b>param_type</b></td><td>{settings.param_type}</td></tr>"
+            f"<tr><td><b>s_default_params</b></td>"
+            f"    <td>{fmt_params(settings.s_default_params)}</td></tr>"
+            f"<tr><td><b>z_default_params</b></td>"
+            f"    <td>{fmt_params(settings.z_default_params)}</td></tr>"
+            f"<tr><td><b>y_default_params</b></td>"
+            f"    <td>{fmt_params(settings.y_default_params)}</td></tr>"
+            f"<tr><td><b>plot_format</b></td><td>{settings.plot_format}</td></tr>"
+            f"<tr><td><b>z0</b></td><td>{settings.z0} Ω</td></tr>"
+            f"</table>"
         )
 
     def dragEnterEvent(self, event):
