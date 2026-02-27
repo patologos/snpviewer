@@ -105,6 +105,14 @@ class AppSettings:
         self.plot_format: str = 'DB'
         self.z0: float = 50.0
 
+        # Graph / font settings
+        self.font_family: str = 'sans-serif'
+        self.font_size: int = 10    # base body text
+        self.label_size: int = 11   # axis labels
+        self.title_size: int = 12   # plot title
+        self.tick_size: int = 9     # tick labels
+        self.legend_size: int = 9   # legend text
+
         self._path = self._find_conf_file()
         if self._path:
             self._load(self._path)
@@ -188,6 +196,24 @@ class AppSettings:
             except ValueError:
                 pass
 
+        # font / graph settings
+        if 'font_family' in raw:
+            self.font_family = raw['font_family']
+        for _key, _attr, _lo, _hi in [
+            ('font_size',   'font_size',   4, 32),
+            ('label_size',  'label_size',  4, 32),
+            ('title_size',  'title_size',  4, 32),
+            ('tick_size',   'tick_size',   4, 24),
+            ('legend_size', 'legend_size', 4, 24),
+        ]:
+            if _key in raw:
+                try:
+                    v = int(raw[_key])
+                    if _lo <= v <= _hi:
+                        setattr(self, _attr, v)
+                except ValueError:
+                    pass
+
     @staticmethod
     def _parse_params(value: str, default: list) -> list:
         """Parse a param list like '11, 21' into [(0,0),(1,0)].
@@ -266,23 +292,27 @@ class NatureColors:
 
     @staticmethod
     def apply_matplotlib_defaults():
-        """Set matplotlib rcParams for Nature-style plots."""
+        """Set matplotlib rcParams for Nature-style plots.
+
+        Font and size values are read from the AppSettings singleton so
+        they can be tuned via snpviewer.conf without touching this file.
+        """
         plt.rcParams.update({
-            'font.family': 'sans-serif',
+            'font.family': settings.font_family,
             'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
-            'font.size': 10,
-            'axes.labelsize': 11,
-            'axes.titlesize': 12,
+            'font.size': settings.font_size,
+            'axes.labelsize': settings.label_size,
+            'axes.titlesize': settings.title_size,
             'axes.titleweight': 'bold',
             'axes.linewidth': 0.8,
             'axes.edgecolor': '#333333',
-            'xtick.labelsize': 9,
-            'ytick.labelsize': 9,
+            'xtick.labelsize': settings.tick_size,
+            'ytick.labelsize': settings.tick_size,
             'xtick.direction': 'in',
             'ytick.direction': 'in',
             'xtick.major.size': 4,
             'ytick.major.size': 4,
-            'legend.fontsize': 9,
+            'legend.fontsize': settings.legend_size,
             'legend.framealpha': 0.9,
             'legend.edgecolor': '#cccccc',
             'figure.facecolor': 'white',
@@ -308,11 +338,18 @@ class PlotCanvas(FigureCanvasQTAgg):
         super().__init__(self.fig)
         self.setParent(parent)
         self.ax = None
+        self._hover_ann = None          # annotation shown on mouse-over
+        self.mpl_connect('motion_notify_event', self._on_hover)
         self._show_placeholder()
+
+    def _clear_fig(self):
+        """Clear the figure and reset all transient per-plot state."""
+        self._clear_fig()
+        self._hover_ann = None          # old annotation is gone with the axes
 
     def _show_placeholder(self):
         """Show a placeholder message when no data is loaded."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
         self.ax.text(
             0.5, 0.5, 'Load an SNP file to begin',
@@ -370,7 +407,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         mem_network: optional (name, Network) memory reference tuple.
         diff_only: if True, plot only differential traces (not raw traces).
         """
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -452,7 +489,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     def plot_z_magnitude(self, networks, param_list,
                          mem_network=None, diff_only=False):
         """Plot Z-parameters magnitude (dB) for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -520,7 +557,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     def plot_y_magnitude(self, networks, param_list,
                          mem_network=None, diff_only=False):
         """Plot Y-parameters magnitude (dB) for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -588,7 +625,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     def plot_phase(self, networks, param_list,
                    mem_network=None, diff_only=False):
         """Plot S-parameters phase in degrees for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -650,7 +687,7 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     def plot_smith(self, networks, param_list):
         """Plot S-parameters on a Smith chart for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -682,7 +719,7 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     def plot_vswr(self, networks, param_list):
         """Plot VSWR for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -720,7 +757,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     def plot_group_delay(self, networks, param_list,
                          mem_network=None, diff_only=False):
         """Plot group delay for multiple networks."""
-        self.fig.clear()
+        self._clear_fig()
         self.ax = self.fig.add_subplot(111)
 
         if not param_list or not networks:
@@ -1183,6 +1220,98 @@ class PlotCanvas(FigureCanvasQTAgg):
                 except Exception:
                     pass
         self._change_annotations = []
+
+    # ------------------------------------------------------------------
+    # Hover tooltip
+    # ------------------------------------------------------------------
+
+    def _on_hover(self, event):
+        """Show a data-point tooltip when the cursor is near a plotted line."""
+        if self.ax is None or event.inaxes != self.ax:
+            self._hide_hover()
+            return
+
+        PIXEL_THRESH = 20           # snap radius in screen pixels
+        best_dist = PIXEL_THRESH + 1
+        best_x = best_y = best_label = best_color = None
+
+        xmin, xmax = self.ax.get_xlim()
+
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if xd is None or len(xd) <= 2:
+                continue                     # skip axhline / axvline markers
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue                     # skip internal matplotlib lines
+
+            xd = np.asarray(xd, dtype=float)
+            yd = np.asarray(yd, dtype=float)
+
+            # Restrict to the currently visible x-range for speed
+            vis = (xd >= xmin) & (xd <= xmax)
+            if not vis.any():
+                continue
+            xd_v, yd_v = xd[vis], yd[vis]
+
+            # Convert data coords → display (pixel) coords, measure distance
+            pts = self.ax.transData.transform(np.column_stack([xd_v, yd_v]))
+            dists = np.hypot(pts[:, 0] - event.x, pts[:, 1] - event.y)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist:
+                best_dist = dists[idx]
+                best_x    = xd_v[idx]
+                best_y    = yd_v[idx]
+                best_label = lbl
+                best_color = ln.get_color()
+
+        if best_x is None:
+            self._hide_hover()
+            return
+
+        # Build tooltip text
+        f_unit = self._get_freq_unit()
+        if f_unit:                           # frequency-based plot
+            text = f'{best_x:.5g} {f_unit}\n{best_y:.4g}'
+        else:                               # Smith chart — show Re / Im
+            text = f'Re: {best_x:.4g}\nIm: {best_y:.4g}'
+        if best_label and not best_label.startswith('_'):
+            text = f'{best_label}\n' + text
+
+        self._show_hover(best_x, best_y, text, best_color or '#555555')
+
+    def _show_hover(self, x, y, text, color):
+        """Create or update the hover annotation at data point (x, y)."""
+        if self._hover_ann is None:
+            self._hover_ann = self.ax.annotate(
+                text,
+                xy=(x, y),
+                xytext=(12, 12),
+                textcoords='offset points',
+                fontsize=8,
+                family='monospace',
+                bbox=dict(
+                    boxstyle='round,pad=0.4',
+                    facecolor='lightyellow',
+                    edgecolor=color,
+                    alpha=0.93,
+                    linewidth=1.2,
+                ),
+                zorder=20,
+            )
+        else:
+            self._hover_ann.set_text(text)
+            self._hover_ann.xy = (x, y)
+            self._hover_ann.get_bbox_patch().set_edgecolor(color)
+            self._hover_ann.set_visible(True)
+        self.draw_idle()
+
+    def _hide_hover(self):
+        """Hide the hover annotation without destroying it."""
+        if self._hover_ann is not None and self._hover_ann.get_visible():
+            self._hover_ann.set_visible(False)
+            self.draw_idle()
 
 
 # ---------------------------------------------------------------------------
