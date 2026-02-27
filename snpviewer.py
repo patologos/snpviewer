@@ -79,6 +79,147 @@ def auto_freq_scale(freq_hz):
 
 
 # ---------------------------------------------------------------------------
+# Settings Loader
+# ---------------------------------------------------------------------------
+
+class AppSettings:
+    """Load and expose settings from a human-readable .conf file.
+
+    The file is searched in this order:
+      1. <directory of snpviewer.py>/snpviewer.conf
+      2. ~/.snpviewer.conf
+
+    Lines starting with '#' are comments.  Each setting is a simple
+    ``key = value`` pair.  Unknown keys are silently ignored.
+    """
+
+    _VALID_PARAM_TYPES = {'S', 'Z', 'Y'}
+    _VALID_FORMATS = {'DB', 'MA', 'RI'}
+
+    def __init__(self):
+        # Defaults (used when no conf file is found or a key is missing)
+        self.param_type: str = 'S'
+        self.s_default_params: list = [(0, 0), (1, 0)]  # S1,1 and S2,1
+        self.z_default_params: list = [(0, 0)]
+        self.y_default_params: list = [(0, 0)]
+        self.plot_format: str = 'DB'
+        self.z0: float = 50.0
+
+        self._path = self._find_conf_file()
+        if self._path:
+            self._load(self._path)
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def default_params_for(self, param_type: str) -> list:
+        """Return the default (m, n) list for the given param type."""
+        pt = param_type.upper()
+        if pt == 'Z':
+            return list(self.z_default_params)
+        if pt == 'Y':
+            return list(self.y_default_params)
+        return list(self.s_default_params)
+
+    def conf_path(self):
+        """Return the path to the loaded conf file, or None."""
+        return self._path
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_conf_file():
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'snpviewer.conf'),
+            os.path.expanduser('~/.snpviewer.conf'),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _load(self, path):
+        raw = {}
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip().lower()
+                value = value.strip()
+                # Strip inline comments
+                if '#' in value:
+                    value = value[:value.index('#')].strip()
+                raw[key] = value
+
+        # param_type
+        if 'param_type' in raw:
+            v = raw['param_type'].upper()
+            if v in self._VALID_PARAM_TYPES:
+                self.param_type = v
+
+        # default param selections
+        self.s_default_params = self._parse_params(
+            raw.get('s_default_params', ''), [(0, 0), (1, 0)])
+        self.z_default_params = self._parse_params(
+            raw.get('z_default_params', ''), [(0, 0)])
+        self.y_default_params = self._parse_params(
+            raw.get('y_default_params', ''), [(0, 0)])
+
+        # plot_format
+        if 'plot_format' in raw:
+            v = raw['plot_format'].upper()
+            if v in self._VALID_FORMATS:
+                self.plot_format = v
+
+        # z0
+        if 'z0' in raw:
+            try:
+                v = float(raw['z0'])
+                if 0.1 <= v <= 10000.0:
+                    self.z0 = v
+            except ValueError:
+                pass
+
+    @staticmethod
+    def _parse_params(value: str, default: list) -> list:
+        """Parse a param list like '11, 21' into [(0,0),(1,0)].
+
+        Special tokens:
+          'all'  -> sentinel meaning "check everything"
+          'none' -> empty list
+        """
+        v = value.strip().lower()
+        if not v:
+            return default
+        if v == 'none':
+            return []
+        if v == 'all':
+            return None  # None = "all available"
+
+        result = []
+        for token in v.split(','):
+            token = token.strip()
+            if len(token) == 2 and token.isdigit():
+                m = int(token[0]) - 1
+                n = int(token[1]) - 1
+                if m >= 0 and n >= 0:
+                    result.append((m, n))
+        return result if result else default
+
+
+# Module-level singleton — loaded once at import time
+settings = AppSettings()
+
+
+# ---------------------------------------------------------------------------
 # Nature Journal Color Palette
 # ---------------------------------------------------------------------------
 
@@ -278,8 +419,8 @@ class PlotCanvas(FigureCanvasQTAgg):
 
                 # Raw trace
                 s_raw = network.s[:, m, n]
-                s_db = 20 * np.log10(np.where(np.abs(s_raw) == 0, 1e-30,
-                                               np.abs(s_raw)))
+                s_mag = np.abs(s_raw)
+                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
 
                 if not diff_only:
                     label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
@@ -290,8 +431,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 # Differential trace (skip when this network is the memory itself)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     diff_raw = s_raw - mem_interp[:, m, n]
-                    diff_db = 20 * np.log10(np.where(np.abs(diff_raw) == 0,
-                                                      1e-30, np.abs(diff_raw)))
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
                     diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
                                 else f'\u0394S{m+1},{n+1}')
                     self.ax.plot(freq, diff_db, color=color,
@@ -306,7 +447,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Magnitude (dB)')
         self._style_axes(title)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_z_magnitude(self, networks, param_list,
@@ -351,8 +491,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 color = NatureColors.get_color(trace_idx)
                 linestyle = NatureColors.get_linestyle(file_idx)
                 z_raw = network.z[:, m, n]
-                z_db = 20 * np.log10(np.where(np.abs(z_raw) == 0, 1e-30,
-                                               np.abs(z_raw)))
+                z_mag = np.abs(z_raw)
+                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
                 if not diff_only:
                     label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
                     self.ax.plot(freq, z_db, color=color,
@@ -360,8 +500,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     diff_raw = z_raw - mem_interp[:, m, n]
-                    diff_db = 20 * np.log10(np.where(np.abs(diff_raw) == 0,
-                                                      1e-30, np.abs(diff_raw)))
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
                     diff_lbl = (f'\u0394{name} Z{m+1},{n+1}' if multi
                                 else f'\u0394Z{m+1},{n+1}')
                     self.ax.plot(freq, diff_db, color=color,
@@ -375,7 +515,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('|Z| (dB\u03A9)')
         self._style_axes(title)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_y_magnitude(self, networks, param_list,
@@ -420,8 +559,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                 color = NatureColors.get_color(trace_idx)
                 linestyle = NatureColors.get_linestyle(file_idx)
                 y_raw = network.y[:, m, n]
-                y_db = 20 * np.log10(np.where(np.abs(y_raw) == 0, 1e-30,
-                                               np.abs(y_raw)))
+                y_mag = np.abs(y_raw)
+                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
                 if not diff_only:
                     label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
                     self.ax.plot(freq, y_db, color=color,
@@ -429,8 +568,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     diff_raw = y_raw - mem_interp[:, m, n]
-                    diff_db = 20 * np.log10(np.where(np.abs(diff_raw) == 0,
-                                                      1e-30, np.abs(diff_raw)))
+                    diff_mag = np.abs(diff_raw)
+                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
                     diff_lbl = (f'\u0394{name} Y{m+1},{n+1}' if multi
                                 else f'\u0394Y{m+1},{n+1}')
                     self.ax.plot(freq, diff_db, color=color,
@@ -444,7 +583,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('|Y| (dBS)')
         self._style_axes(title)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_phase(self, networks, param_list,
@@ -508,7 +646,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Phase (degrees)')
         self._style_axes(title)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_smith(self, networks, param_list):
@@ -541,7 +678,6 @@ class PlotCanvas(FigureCanvasQTAgg):
 
         self.ax.set_title('Smith Chart', pad=10, fontsize=12, fontweight='bold')
         self.ax.legend(loc='upper right', frameon=True)
-        self.fig.tight_layout()
         self.draw()
 
     def plot_vswr(self, networks, param_list):
@@ -579,7 +715,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_ylabel('VSWR')
         self.ax.set_ylim(bottom=1)
         self._style_axes('VSWR')
-        self.fig.tight_layout()
         self.draw()
 
     def plot_group_delay(self, networks, param_list,
@@ -657,7 +792,6 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Group Delay (ns)')
         self._style_axes(title)
-        self.fig.tight_layout()
         self.draw()
 
     def _show_no_params(self):
@@ -1228,13 +1362,15 @@ class ParameterSelector(QGroupBox):
                 cb = QCheckBox(f'{p}{m + 1},{n + 1}')
                 cb.setProperty('row', m)
                 cb.setProperty('col', n)
-                # Restore previous state, or use defaults on first build
+                # Restore previous state, or use settings defaults on first build
                 if prev_checked:
                     cb.setChecked((m, n) in prev_checked)
                 else:
-                    if (m, n) == (0, 0):
+                    default = settings.default_params_for(self._param_type)
+                    if default is None:  # 'all' sentinel
                         cb.setChecked(True)
-                    # S2,1 not checked by default — user picks what they need
+                    else:
+                        cb.setChecked((m, n) in default)
                 cb.stateChanged.connect(self._on_changed)
                 self._layout.addWidget(cb, m, n)
                 self._checkboxes.append(cb)
@@ -1398,8 +1534,6 @@ class ConversionPanel(QGroupBox):
 
     def _write_converted(self, network, filepath, param, form, z0):
         """Write network with parameter conversion."""
-        # scikit-rf supports writing with different parameter types
-        # through the Touchstone file format
         freq = network.frequency
 
         if param == 'z':
@@ -1412,31 +1546,28 @@ class ConversionPanel(QGroupBox):
         n_ports = network.number_of_ports
 
         with open(filepath, 'w') as f:
-            # Write header
             freq_unit = freq.unit.upper()
-            if freq_unit == 'HZ':
-                freq_unit = 'HZ'
             f.write(f"! Converted by SNP Viewer\n")
             f.write(f"# {freq_unit} {param.upper()} {form.upper()} R {z0}\n")
 
-            for k in range(len(freq.f)):
-                line = f"{freq.f[k]:.10g}"
-                for m in range(n_ports):
-                    for n in range(n_ports):
-                        val = data[k, m, n]
-                        if form == 'ri':
-                            line += f"  {val.real:.10g}  {val.imag:.10g}"
-                        elif form == 'ma':
-                            mag = np.abs(val)
-                            ang = np.degrees(np.angle(val))
-                            line += f"  {mag:.10g}  {ang:.10g}"
-                        elif form == 'db':
-                            mag_db = 20 * np.log10(np.abs(val) + 1e-30)
-                            ang = np.degrees(np.angle(val))
-                            line += f"  {mag_db:.10g}  {ang:.10g}"
-                        else:
-                            line += f"  {val.real:.10g}  {val.imag:.10g}"
-                f.write(line + "\n")
+            # Build a 2-D matrix [N_freq × (1 + 2*n_ports²)] then write
+            # in one C-level pass with np.savetxt — much faster than a
+            # Python loop over frequency points.
+            cols = [freq.f]
+            for m in range(n_ports):
+                for n in range(n_ports):
+                    val = data[:, m, n]
+                    if form == 'ri':
+                        cols.append(val.real)
+                        cols.append(val.imag)
+                    elif form == 'ma':
+                        cols.append(np.abs(val))
+                        cols.append(np.degrees(np.angle(val)))
+                    else:  # db
+                        cols.append(20 * np.log10(np.abs(val) + 1e-30))
+                        cols.append(np.degrees(np.angle(val)))
+
+            np.savetxt(f, np.column_stack(cols), fmt='%.10g')
 
 
 # ---------------------------------------------------------------------------
@@ -1461,7 +1592,7 @@ class SNPViewerApp(QMainWindow):
         self.resize(1200, 750)
         self.setAcceptDrops(True)
 
-        self._param_type = 'S'   # 'S', 'Z', or 'Y'
+        self._param_type = settings.param_type   # 'S', 'Z', or 'Y'
 
         # Math Memory state
         self._mem_network = None   # (short_name, Network) or None
@@ -1545,6 +1676,7 @@ class SNPViewerApp(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setMaximumHeight(180)
         self.param_selector = ParameterSelector()
+        self.param_selector.set_param_type(self._param_type)
         scroll.setWidget(self.param_selector)
         sidebar_layout.addWidget(scroll)
 
@@ -1557,6 +1689,15 @@ class SNPViewerApp(QMainWindow):
         # Conversion panel
         self.conversion_panel = ConversionPanel()
         sidebar_layout.addWidget(self.conversion_panel)
+
+        # Apply settings to conversion panel defaults
+        fmt_idx = self.conversion_panel.format_combo.findText(settings.plot_format)
+        if fmt_idx >= 0:
+            self.conversion_panel.format_combo.setCurrentIndex(fmt_idx)
+        self.conversion_panel.z0_spin.setValue(settings.z0)
+        param_idx = self.conversion_panel.param_combo.findText(self._param_type)
+        if param_idx >= 0:
+            self.conversion_panel.param_combo.setCurrentIndex(param_idx)
 
         sidebar_layout.addStretch()
 
@@ -1643,6 +1784,10 @@ class SNPViewerApp(QMainWindow):
         file_menu.addAction(exit_action)
 
         help_menu = menubar.addMenu("&Help")
+        settings_action = QAction("&Settings Info...", self)
+        settings_action.triggered.connect(self._show_settings_info)
+        help_menu.addAction(settings_action)
+        help_menu.addSeparator()
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1702,21 +1847,21 @@ class SNPViewerApp(QMainWindow):
         """
         self.s_action = QAction("S", self)
         self.s_action.setCheckable(True)
-        self.s_action.setChecked(True)
+        self.s_action.setChecked(self._param_type == 'S')
         self.s_action.setToolTip("Display S-parameters")
         self.s_action.triggered.connect(lambda: self._on_param_type_changed('S'))
         toolbar.addAction(self.s_action)
 
         self.z_action = QAction("Z", self)
         self.z_action.setCheckable(True)
-        self.z_action.setChecked(False)
+        self.z_action.setChecked(self._param_type == 'Z')
         self.z_action.setToolTip("Display Z-parameters (impedance)")
         self.z_action.triggered.connect(lambda: self._on_param_type_changed('Z'))
         toolbar.addAction(self.z_action)
 
         self.y_action = QAction("Y", self)
         self.y_action.setCheckable(True)
-        self.y_action.setChecked(False)
+        self.y_action.setChecked(self._param_type == 'Y')
         self.y_action.setToolTip("Display Y-parameters (admittance)")
         self.y_action.triggered.connect(lambda: self._on_param_type_changed('Y'))
         toolbar.addAction(self.y_action)
@@ -2091,6 +2236,52 @@ class SNPViewerApp(QMainWindow):
             "of magnitude, phase, Smith chart, VSWR, and group delay.</p>"
             "<p>Uses Nature Journal color scheme.</p>"
             "<p>Built with PyQt5, matplotlib, and scikit-rf.</p>"
+            "<hr>"
+            "<p><b>Author:</b> Daniel Hedlund<br>"
+            "<b>Contact:</b> <a href='mailto:daniel.hedlund@gmail.com'>"
+            "daniel.hedlund@gmail.com</a></p>"
+            "<hr>"
+            "<p style='font-size: 8pt; color: #666;'>"
+            "<b>THE BEER-WARE LICENSE</b> (Revision 42):<br>"
+            "Daniel Hedlund wrote this file. As long as you retain this notice "
+            "you can do whatever you want with this stuff. If we meet some day, "
+            "and you think this stuff is worth it, you can buy me a beer in return."
+            "</p>"
+        )
+
+    def _show_settings_info(self):
+        """Show which settings file is active and its current values."""
+        conf_path = settings.conf_path()
+        if conf_path:
+            source = f"<p><b>Loaded from:</b><br><code>{conf_path}</code></p>"
+        else:
+            source = (
+                "<p><b>No settings file found.</b> Using built-in defaults.<br>"
+                "Create <code>snpviewer.conf</code> next to snpviewer.py "
+                "or <code>~/.snpviewer.conf</code> to customise defaults.</p>"
+            )
+
+        def fmt_params(lst):
+            if lst is None:
+                return "all"
+            if not lst:
+                return "none"
+            return ", ".join(f"{m+1}{n+1}" for m, n in lst)
+
+        QMessageBox.information(
+            self, "Settings",
+            f"{source}"
+            f"<table cellspacing='4'>"
+            f"<tr><td><b>param_type</b></td><td>{settings.param_type}</td></tr>"
+            f"<tr><td><b>s_default_params</b></td>"
+            f"    <td>{fmt_params(settings.s_default_params)}</td></tr>"
+            f"<tr><td><b>z_default_params</b></td>"
+            f"    <td>{fmt_params(settings.z_default_params)}</td></tr>"
+            f"<tr><td><b>y_default_params</b></td>"
+            f"    <td>{fmt_params(settings.y_default_params)}</td></tr>"
+            f"<tr><td><b>plot_format</b></td><td>{settings.plot_format}</td></tr>"
+            f"<tr><td><b>z0</b></td><td>{settings.z0} Ω</td></tr>"
+            f"</table>"
         )
 
     def dragEnterEvent(self, event):
