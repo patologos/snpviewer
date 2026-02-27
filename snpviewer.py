@@ -344,7 +344,7 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     def _clear_fig(self):
         """Clear the figure and reset all transient per-plot state."""
-        self._clear_fig()
+        self.fig.clear()
         self._hover_ann = None          # old annotation is gone with the axes
 
     def _show_placeholder(self):
