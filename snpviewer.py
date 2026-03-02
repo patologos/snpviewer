@@ -432,7 +432,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 s_mag = np.abs(mem_net.s[:, m, n])
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
-                lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                lbl = f'MEM {mem_name} S{m+1}{n+1}'
                 self.ax.plot(freq_m, s_db,
                              color='#AAAAAA', linewidth=1.4,
                              linestyle='--', label=lbl, alpha=0.75)
@@ -460,7 +460,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
 
                 if not diff_only:
-                    label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                    label = f'{name} S{m+1}{n+1}'
                     self.ax.plot(freq, s_db, color=color,
                                  label=label, linewidth=1.8,
                                  linestyle=linestyle)
@@ -470,8 +470,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     diff_raw = s_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
-                                else f'\u0394S{m+1},{n+1}')
+                    diff_lbl = f'\u0394{name} S{m+1}{n+1}'
                     self.ax.plot(freq, diff_db, color=color,
                                  label=diff_lbl, linewidth=1.8,
                                  linestyle=':', alpha=0.9)
@@ -511,7 +510,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 z_mag = np.abs(mem_net.z[:, m, n])
                 z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
-                lbl = f'MEM {mem_name} Z{m+1},{n+1}' if multi else f'MEM Z{m+1},{n+1}'
+                lbl = f'MEM {mem_name} Z{m+1}{n+1}'
                 self.ax.plot(freq_m, z_db,
                              color='#AAAAAA', linewidth=1.4,
                              linestyle='--', label=lbl, alpha=0.75)
@@ -531,7 +530,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 z_mag = np.abs(z_raw)
                 z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
                 if not diff_only:
-                    label = f'{name} Z{m+1},{n+1}' if multi else f'Z{m+1},{n+1}'
+                    label = f'{name} Z{m+1}{n+1}'
                     self.ax.plot(freq, z_db, color=color,
                                  label=label, linewidth=1.8,
                                  linestyle=linestyle)
@@ -539,8 +538,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     diff_raw = z_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = (f'\u0394{name} Z{m+1},{n+1}' if multi
-                                else f'\u0394Z{m+1},{n+1}')
+                    diff_lbl = f'\u0394{name} Z{m+1}{n+1}'
                     self.ax.plot(freq, diff_db, color=color,
                                  label=diff_lbl, linewidth=1.8,
                                  linestyle=':', alpha=0.9)
@@ -579,7 +577,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 y_mag = np.abs(mem_net.y[:, m, n])
                 y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
-                lbl = f'MEM {mem_name} Y{m+1},{n+1}' if multi else f'MEM Y{m+1},{n+1}'
+                lbl = f'MEM {mem_name} Y{m+1}{n+1}'
                 self.ax.plot(freq_m, y_db,
                              color='#AAAAAA', linewidth=1.4,
                              linestyle='--', label=lbl, alpha=0.75)
@@ -599,7 +597,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 y_mag = np.abs(y_raw)
                 y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
                 if not diff_only:
-                    label = f'{name} Y{m+1},{n+1}' if multi else f'Y{m+1},{n+1}'
+                    label = f'{name} Y{m+1}{n+1}'
                     self.ax.plot(freq, y_db, color=color,
                                  label=label, linewidth=1.8,
                                  linestyle=linestyle)
@@ -607,8 +605,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     diff_raw = y_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = (f'\u0394{name} Y{m+1},{n+1}' if multi
-                                else f'\u0394Y{m+1},{n+1}')
+                    diff_lbl = f'\u0394{name} Y{m+1}{n+1}'
                     self.ax.plot(freq, diff_db, color=color,
                                  label=diff_lbl, linewidth=1.8,
                                  linestyle=':', alpha=0.9)
@@ -645,7 +642,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             for m, n in param_list:
                 if m >= n_ports_m or n >= n_ports_m:
                     continue
-                lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                lbl = f'MEM {mem_name} S{m+1}{n+1}'
                 self.ax.plot(freq_m, mem_net.s_deg[:, m, n],
                              color='#AAAAAA', linewidth=1.4,
                              linestyle='--', label=lbl, alpha=0.75)
@@ -663,15 +660,14 @@ class PlotCanvas(FigureCanvasQTAgg):
                 linestyle = NatureColors.get_linestyle(file_idx)
                 s_deg = network.s_deg[:, m, n]
                 if not diff_only:
-                    label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                    label = f'{name} S{m+1}{n+1}'
                     self.ax.plot(freq, s_deg, color=color,
                                  label=label, linewidth=1.8,
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     mem_deg = np.degrees(np.angle(mem_interp[:, m, n]))
                     diff_deg = s_deg - mem_deg
-                    diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
-                                else f'\u0394S{m+1},{n+1}')
+                    diff_lbl = f'\u0394{name} S{m+1}{n+1}'
                     self.ax.plot(freq, diff_deg, color=color,
                                  label=diff_lbl, linewidth=1.8,
                                  linestyle=':', alpha=0.9)
@@ -704,7 +700,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                label = f'{name} S{m+1}{n+1}'
                 network.plot_s_smith(
                     m=m, n=n, ax=self.ax, color=color,
                     label=label, linewidth=1.8,
@@ -742,7 +738,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_mag = np.abs(network.s[:, m, n])
                 vswr = (1 + s_mag) / (1 - s_mag)
                 vswr = np.clip(vswr, 1, 100)
-                label = f'{name} VSWR(S{m+1},{n+1})' if multi else f'VSWR(S{m+1},{n+1})'
+                label = f'{name} VSWR(S{m+1}{n+1})'
                 self.ax.plot(freq, vswr, color=color,
                              label=label, linewidth=1.8,
                              linestyle=NatureColors.get_linestyle(file_idx))
@@ -786,7 +782,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 gd = _group_delay_ns(mem_net, m, n)
                 if gd is not None:
-                    lbl = f'MEM {mem_name} S{m+1},{n+1}' if multi else f'MEM S{m+1},{n+1}'
+                    lbl = f'MEM {mem_name} S{m+1}{n+1}'
                     self.ax.plot(freq_m, gd,
                                  color='#AAAAAA', linewidth=1.4,
                                  linestyle='--', label=lbl, alpha=0.75)
@@ -805,7 +801,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 gd = _group_delay_ns(network, m, n)
                 if gd is not None:
                     if not diff_only:
-                        label = f'{name} S{m+1},{n+1}' if multi else f'S{m+1},{n+1}'
+                        label = f'{name} S{m+1}{n+1}'
                         self.ax.plot(freq, gd, color=color,
                                      label=label, linewidth=1.8,
                                      linestyle=linestyle)
@@ -816,8 +812,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                         mem_phase_rad = np.unwrap(np.angle(mem_interp[:, m, n]))
                         omega = 2 * np.pi * network.frequency.f
                         mem_gd = -np.gradient(mem_phase_rad, omega) * 1e9
-                        diff_lbl = (f'\u0394{name} S{m+1},{n+1}' if multi
-                                    else f'\u0394S{m+1},{n+1}')
+                        diff_lbl = f'\u0394{name} S{m+1}{n+1}'
                         self.ax.plot(freq, gd - mem_gd, color=color,
                                      label=diff_lbl, linewidth=1.8,
                                      linestyle=':', alpha=0.9)
@@ -1010,6 +1005,88 @@ class PlotCanvas(FigureCanvasQTAgg):
                 results.append(r)
 
         return results
+
+    def extract_all_peaks_q(self, prominence_db=10.0):
+        """Automatically find all peaks in every visible data trace and compute
+        Q for each peak.
+
+        Peak detection uses a noise-floor-aware threshold:
+          - noise floor  = median of the trace (robust background estimate)
+          - height gate  = noise_floor + prominence_db  (only peaks above this)
+          - prominence   = prominence_db  (relative drop required on both sides)
+
+        The Q search window for each peak is bounded by the local valley
+        (minimum) between it and the adjacent accepted peaks.  This prevents
+        the window from containing a second competing peak that would mislead
+        the 3 dB crossing search.
+
+        Parameters
+        ----------
+        prominence_db : float
+            Minimum dB of prominence AND minimum dB above the median noise
+            floor required for a peak to be accepted.  Increase this value
+            to suppress false peaks in noisy or broad-band traces.
+
+        Returns a list of dicts (one per peak with computable 3 dB crossings),
+        each containing: label, f0, left_f (f1), right_f (f2), bw (Δf),
+        q, f_unit.
+        """
+        if self.ax is None:
+            return []
+
+        f_unit = self._get_freq_unit()
+        all_results = []
+
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if xd is None or len(xd) <= 2:
+                continue
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue
+
+            xdata = np.asarray(xd, dtype=float)
+            ydata = np.asarray(yd, dtype=float)
+            color = ln.get_color()
+
+            # Noise-floor-aware peak detection (same strategy as find_and_annotate_changes)
+            noise_floor = np.median(ydata)
+            threshold = noise_floor + prominence_db
+            peaks, _ = find_peaks(ydata, height=threshold, prominence=prominence_db)
+            if len(peaks) == 0:
+                continue
+
+            for i, pk in enumerate(peaks):
+                # Boundaries: edge of data (or previous/next accepted peak index)
+                prev_end = peaks[i - 1] if i > 0 else 0
+                next_end = peaks[i + 1] if i < len(peaks) - 1 else len(xdata) - 1
+
+                # Use the valley (local minimum) between this peak and its
+                # neighbours as the window boundary — keeps competing peaks out.
+                left_seg = ydata[prev_end:pk + 1]
+                left_idx = prev_end + int(np.argmin(left_seg)) if len(left_seg) > 0 else prev_end
+
+                right_seg = ydata[pk:next_end + 1]
+                right_idx = pk + int(np.argmin(right_seg)) if len(right_seg) > 0 else next_end
+
+                # Safety: if the valley collapsed onto the peak itself, widen out
+                if left_idx >= pk:
+                    left_idx = (prev_end + pk) // 2
+                if right_idx <= pk:
+                    right_idx = (pk + next_end + 1) // 2
+
+                xmin = xdata[left_idx]
+                xmax = xdata[right_idx]
+
+                r = self._compute_q_one_trace(xdata, ydata, xmin, xmax)
+                if r is not None:
+                    r['label'] = lbl
+                    r['color'] = color
+                    r['f_unit'] = f_unit
+                    all_results.append(r)
+
+        return all_results
 
     def annotate_q_results(self, results):
         """Draw Q-measurement annotations for all traces.
@@ -2012,6 +2089,15 @@ class SNPViewerApp(QMainWindow):
         self.clear_q_action.triggered.connect(self._on_clear_q)
         toolbar.addAction(self.clear_q_action)
 
+        self.extract_all_q_action = QAction("Extract all Q", self)
+        self.extract_all_q_action.setToolTip(
+            "Automatically find all peaks in all traces, compute Q for each,\n"
+            "and save results (f0, f1, f2, \u0394f, Q) to a CSV file."
+        )
+        self.extract_all_q_action.setEnabled(False)
+        self.extract_all_q_action.triggered.connect(self._on_extract_all_q)
+        toolbar.addAction(self.extract_all_q_action)
+
         toolbar.addSeparator()
 
         self.mem_action = QAction("Set Mem", self)
@@ -2104,6 +2190,7 @@ class SNPViewerApp(QMainWindow):
         # Q button only active on magnitude tab when data is present
         on_magnitude = (self.plot_tab_bar.currentIndex() == self.PLOT_MAGNITUDE)
         self.q_action.setEnabled(on_magnitude and bool(networks))
+        self.extract_all_q_action.setEnabled(on_magnitude and bool(networks))
         # Math memory: "Set Mem" available whenever at least one file is selected
         self.mem_action.setEnabled(bool(networks))
 
@@ -2118,6 +2205,7 @@ class SNPViewerApp(QMainWindow):
             self.q_action.setEnabled(False)
             self.q_action.setChecked(False)
             self.clear_q_action.setEnabled(False)
+            self.extract_all_q_action.setEnabled(False)
             self.mem_action.setEnabled(False)
             self._update_status("No files loaded.")
 
@@ -2200,6 +2288,7 @@ class SNPViewerApp(QMainWindow):
         networks = self.file_list.get_selected_networks()
         has_data = bool(networks)
         self.q_action.setEnabled(on_magnitude and has_data)
+        self.extract_all_q_action.setEnabled(on_magnitude and has_data)
         if not on_magnitude:
             self.q_action.setChecked(False)
             self.canvas._clear_q_annotations()
@@ -2259,6 +2348,75 @@ class SNPViewerApp(QMainWindow):
         self.canvas.draw()
         self.clear_q_action.setEnabled(False)
         self._update_status("Q annotations cleared.")
+
+    def _on_extract_all_q(self):
+        """Find all peaks in all visible traces, compute Q for each, save CSV."""
+        import csv
+
+        # Ask for the prominence / noise-floor threshold, remembering the last value
+        default_prom = getattr(self, '_last_extract_q_prominence', 10.0)
+        prominence_db, ok = QInputDialog.getDouble(
+            self,
+            "Extract all Q – Peak Threshold",
+            "Minimum peak prominence above median noise floor (dB):\n"
+            "(Higher values suppress false peaks; lower values detect weaker peaks.\n"
+            "Typical starting point: 10 dB for resonance measurements.)",
+            default_prom,   # current default
+            0.5,            # minimum allowed
+            100.0,          # maximum allowed
+            1,              # decimal places shown
+        )
+        if not ok:
+            return
+        self._last_extract_q_prominence = prominence_db
+
+        results = self.canvas.extract_all_peaks_q(prominence_db=prominence_db)
+        if not results:
+            QMessageBox.warning(
+                self, "Extract all Q",
+                f"No peaks found with prominence ≥ {prominence_db:.1f} dB above the median.\n\n"
+                "Try lowering the threshold, or check that the Magnitude tab is active."
+            )
+            return
+
+        f_unit = results[0]['f_unit']
+        default_name = "q_factors.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Q Results", default_name,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+
+        with open(path, 'w', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                'Trace',
+                f'f0 ({f_unit})',
+                f'f1 ({f_unit})',
+                f'f2 ({f_unit})',
+                f'Delta_f ({f_unit})',
+                'Q',
+            ])
+            for r in results:
+                writer.writerow([
+                    r['label'],
+                    f"{r['f0']:.8g}",
+                    f"{r['left_f']:.8g}",
+                    f"{r['right_f']:.8g}",
+                    f"{r['bw']:.8g}",
+                    f"{r['q']:.2f}",
+                ])
+
+        n = len(results)
+        self._update_status(
+            f"Saved {n} Q result(s) to {os.path.basename(path)} "
+            f"(threshold {prominence_db:.1f} dB above median)."
+        )
+        QMessageBox.information(
+            self, "Extract all Q",
+            f"Saved {n} peak Q result(s) to:\n{path}"
+        )
 
     # --- Math Memory slots ---
 
