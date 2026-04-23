@@ -339,6 +339,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.setParent(parent)
         self.ax = None
         self._hover_ann = None          # annotation shown on mouse-over
+        self._square_aspect = False     # force square plot area when True
         self.mpl_connect('motion_notify_event', self._on_hover)
 
         # --- Interactive annotation support ---
@@ -377,6 +378,19 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.legend(loc='best', frameon=True)
         self.ax.set_facecolor('#F5F5F5')
         self.ax.grid(False)
+        self._apply_aspect()
+
+    def _apply_aspect(self):
+        """Apply the current square/free aspect setting to ``self.ax``."""
+        if self.ax is None:
+            return
+        self.ax.set_box_aspect(1 if self._square_aspect else None)
+
+    def set_square_aspect(self, enabled):
+        """Toggle a square plot area. Applies immediately to the current axes."""
+        self._square_aspect = bool(enabled)
+        self._apply_aspect()
+        self.draw_idle()
 
     # ------------------------------------------------------------------
     # Math Memory support
@@ -705,6 +719,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 trace_idx += 1
 
         self.ax.legend(loc='upper right', frameon=True)
+        self._apply_aspect()
         self.draw()
 
     def plot_vswr(self, networks, param_list):
@@ -2459,6 +2474,18 @@ class SNPViewerApp(QMainWindow):
         self.clear_changes_action.triggered.connect(self._on_clear_changes)
         toolbar.addAction(self.clear_changes_action)
 
+        toolbar.addSeparator()
+
+        self.square_action = QAction("Square", self)
+        self.square_action.setCheckable(True)
+        self.square_action.setChecked(False)
+        self.square_action.setToolTip(
+            "Force a square plot area (1:1 axes box) instead of stretching "
+            "to fill the window"
+        )
+        self.square_action.triggered.connect(self._on_square_toggled)
+        toolbar.addAction(self.square_action)
+
     def _connect_signals(self):
         """Wire up all signals and slots."""
         self.file_list.selection_updated.connect(self._on_selection_changed)
@@ -2806,6 +2833,13 @@ class SNPViewerApp(QMainWindow):
         self.canvas.draw()
         self.clear_changes_action.setEnabled(False)
         self._update_status("Change annotations cleared.")
+
+    def _on_square_toggled(self, checked):
+        """Toggle between a square plot area and free stretching."""
+        self.canvas.set_square_aspect(checked)
+        self._update_status(
+            "Square plot area." if checked else "Free plot area."
+        )
 
     def _update_selection_status(self, networks):
         """Update status bar with info about selected networks."""
