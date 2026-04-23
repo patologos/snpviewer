@@ -20,10 +20,10 @@ try:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QAction, QMessageBox,
-        QInputDialog, QSizePolicy, QScrollArea, QFrame
+        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu
     )
     from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize
-    from PyQt5.QtGui import QIcon, QFont, QColor, QPalette
+    from PyQt5.QtGui import QIcon, QFont, QColor, QPalette, QCursor
     from matplotlib.backends.backend_qt5agg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
     )
@@ -33,10 +33,10 @@ except ImportError:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QMessageBox,
-        QInputDialog, QSizePolicy, QScrollArea, QFrame
+        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu
     )
     from PySide6.QtCore import Qt, Signal, QSize
-    from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction
+    from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QCursor
     from matplotlib.backends.backend_qtagg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
     )
@@ -340,6 +340,13 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax = None
         self._hover_ann = None          # annotation shown on mouse-over
         self.mpl_connect('motion_notify_event', self._on_hover)
+
+        # --- Interactive annotation support ---
+        self._dragging_artist = None    # artist currently being dragged
+        self._drag_offset = (0, 0)      # offset from click to artist origin
+        self.mpl_connect('button_press_event', self._on_button_press)
+        self.mpl_connect('button_release_event', self._on_button_release)
+        self.mpl_connect('motion_notify_event', self._on_drag_motion)
         self._show_placeholder()
 
     def _clear_fig(self):
@@ -477,12 +484,9 @@ class PlotCanvas(FigureCanvasQTAgg):
 
                 trace_idx += 1
 
-        title = 'Magnitude'
-        if mem_net is not None:
-            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Magnitude (dB)')
-        self._style_axes(title)
+        self._style_axes()
         self.draw()
 
     def plot_z_magnitude(self, networks, param_list,
@@ -544,12 +548,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
-        title = 'Z-Parameters (Magnitude)'
-        if mem_net is not None:
-            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('|Z| (dB\u03A9)')
-        self._style_axes(title)
+        self._style_axes()
         self.draw()
 
     def plot_y_magnitude(self, networks, param_list,
@@ -611,12 +612,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
-        title = 'Y-Parameters (Magnitude)'
-        if mem_net is not None:
-            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('|Y| (dBS)')
-        self._style_axes(title)
+        self._style_axes()
         self.draw()
 
     def plot_phase(self, networks, param_list,
@@ -673,12 +671,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
-        title = 'Phase'
-        if mem_net is not None:
-            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Phase (degrees)')
-        self._style_axes(title)
+        self._style_axes()
         self.draw()
 
     def plot_smith(self, networks, param_list):
@@ -709,7 +704,6 @@ class PlotCanvas(FigureCanvasQTAgg):
                 first_drawn = True
                 trace_idx += 1
 
-        self.ax.set_title('Smith Chart', pad=10, fontsize=12, fontweight='bold')
         self.ax.legend(loc='upper right', frameon=True)
         self.draw()
 
@@ -747,7 +741,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('VSWR')
         self.ax.set_ylim(bottom=1)
-        self._style_axes('VSWR')
+        self._style_axes()
         self.draw()
 
     def plot_group_delay(self, networks, param_list,
@@ -818,12 +812,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                                      linestyle=':', alpha=0.9)
                 trace_idx += 1
 
-        title = 'Group Delay'
-        if mem_net is not None:
-            title += ' (Math Memory active)'
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Group Delay (ns)')
-        self._style_axes(title)
+        self._style_axes()
         self.draw()
 
     def _show_no_params(self):
@@ -1118,7 +1109,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             if header:
                 text_lines.append(header)
             text_lines.append(
-                f"f0 = {f0_str} {f_unit}   BW = {bw_str}   Q = {q_str}"
+                f"f\u2080 = {f0_str} {f_unit}   BW = {bw_str}   Q = {q_str}"
             )
 
         txt = '\n'.join(text_lines)
@@ -1136,6 +1127,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 alpha=0.93,
             ),
             color='#222222',
+            picker=True,
         )
         self._q_annotations.append(text_ann)
 
@@ -1150,27 +1142,28 @@ class PlotCanvas(FigureCanvasQTAgg):
             # Vertical line at f0 (solid)
             self._q_annotations.append(
                 self.ax.axvline(f0, color=c, linestyle='-',
-                                linewidth=1.4, alpha=0.75)
+                                linewidth=1.4, alpha=0.75, picker=5)
             )
             # Vertical lines at 3 dB crossings (dotted)
             self._q_annotations.append(
                 self.ax.axvline(left_f, color=c, linestyle=':',
-                                linewidth=1.1, alpha=0.75)
+                                linewidth=1.1, alpha=0.75, picker=5)
             )
             self._q_annotations.append(
                 self.ax.axvline(right_f, color=c, linestyle=':',
-                                linewidth=1.1, alpha=0.75)
+                                linewidth=1.1, alpha=0.75, picker=5)
             )
             # Horizontal dashed line at the -3 dB level
             self._q_annotations.append(
                 self.ax.axhline(half_db, color=c, linestyle='--',
-                                linewidth=1.1, alpha=0.75)
+                                linewidth=1.1, alpha=0.75, picker=5)
             )
             # Double-headed arrow spanning the BW
             self._q_annotations.append(
                 self.ax.annotate(
                     '', xy=(right_f, half_db), xytext=(left_f, half_db),
                     arrowprops=dict(arrowstyle='<->', color=c, lw=1.4),
+                    picker=True,
                 )
             )
 
@@ -1256,7 +1249,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 span = self.ax.axvspan(
                     x0, x1,
                     alpha=0.18, color=color, linewidth=0,
-                    zorder=1,
+                    zorder=1, picker=True,
                 )
                 self._change_annotations.append(span)
 
@@ -1267,7 +1260,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 marker = self.ax.plot(
                     fx, fy, marker='v', markersize=8,
                     color=color, alpha=0.9,
-                    linestyle='none', zorder=5,
+                    linestyle='none', zorder=5, picker=5,
                 )
                 self._change_annotations.extend(marker)
 
@@ -1280,6 +1273,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                     va='bottom', ha='left',
                     rotation=90,
                     zorder=6,
+                    picker=True,
                 )
                 self._change_annotations.append(txt)
 
@@ -1389,6 +1383,329 @@ class PlotCanvas(FigureCanvasQTAgg):
         if self._hover_ann is not None and self._hover_ann.get_visible():
             self._hover_ann.set_visible(False)
             self.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Interactive annotation editing (drag, double-click edit, right-click
+    # delete).  Applies to Q-factor and change-detection annotations.
+    # ------------------------------------------------------------------
+
+    def _managed_annotations(self):
+        """Return the combined list of all editable annotation artists."""
+        q = getattr(self, '_q_annotations', [])
+        ch = getattr(self, '_change_annotations', [])
+        return q + ch
+
+    def _hit_annotation(self, event):
+        """Return the first managed annotation artist under *event*, or None."""
+        if event.inaxes != self.ax:
+            return None
+        for artist in reversed(self._managed_annotations()):
+            try:
+                contains, _ = artist.contains(event)
+                if contains:
+                    return artist
+            except Exception:
+                continue
+        return None
+
+    # --- drag to reposition ---
+
+    def _on_button_press(self, event):
+        """Handle mouse button press for drag / double-click / right-click."""
+        if self.ax is None or event.inaxes != self.ax:
+            return
+
+        hit = self._hit_annotation(event)
+
+        # --- Right-click on annotation → annotation context menu ---
+        if event.button == 3 and hit is not None:
+            self._show_annotation_context_menu(hit, event)
+            return
+
+        # --- Right-click on empty area → graph-wide context menu ---
+        if event.button == 3 and hit is None:
+            self._show_graph_context_menu(event)
+            return
+
+        # --- Double-click → edit text ---
+        if event.dblclick and event.button == 1 and hit is not None:
+            self._edit_annotation_text(hit)
+            return
+
+        # --- Single left-click → start drag (only text-like artists) ---
+        if event.button == 1 and hit is not None:
+            from matplotlib.text import Text, Annotation
+            if isinstance(hit, (Text, Annotation)):
+                self._dragging_artist = hit
+                # Store the original position so we can compute offsets
+                if isinstance(hit, Annotation):
+                    ox, oy = hit.xy
+                else:
+                    ox, oy = hit.get_position()
+                self._drag_offset = (event.xdata - ox, event.ydata - oy)
+
+    def _on_drag_motion(self, event):
+        """Move the dragged artist to follow the cursor."""
+        if self._dragging_artist is None:
+            return
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+
+        from matplotlib.text import Text, Annotation
+        a = self._dragging_artist
+        dx, dy = self._drag_offset
+        new_x = event.xdata - dx
+        new_y = event.ydata - dy
+
+        if isinstance(a, Annotation):
+            # For annotations placed in axes-transform, convert data→axes
+            if a.xycoords == self.ax.transAxes or a.xycoords == 'axes fraction':
+                inv = self.ax.transData + self.ax.transAxes.inverted()
+                ax_x, ax_y = inv.transform((event.xdata, event.ydata))
+                a.set_position((ax_x, ax_y))
+            else:
+                a.xy = (new_x, new_y)
+        elif isinstance(a, Text):
+            # Text placed in axes coords (the Q result box)
+            if a.get_transform() == self.ax.transAxes:
+                inv = self.ax.transData + self.ax.transAxes.inverted()
+                ax_x, ax_y = inv.transform((event.xdata, event.ydata))
+                a.set_position((ax_x, ax_y))
+            else:
+                a.set_position((new_x, new_y))
+        self.draw_idle()
+
+    def _on_button_release(self, event):
+        """End any drag in progress."""
+        self._dragging_artist = None
+
+    # --- double-click to edit text ---
+
+    def _edit_annotation_text(self, artist):
+        """Open a dialog to edit the text content of an annotation.
+
+        Supports matplotlib mathtext: wrap math in $ signs, e.g.
+        ``$f_0$`` renders as f with subscript 0, ``$\\Delta f$`` for
+        Greek letters, ``$f_{12}$`` for multi-char subscripts.
+        """
+        from matplotlib.text import Text, Annotation
+        if not isinstance(artist, (Text, Annotation)):
+            return
+
+        old_text = artist.get_text()
+        prompt = ('Text (use $f_0$ for subscripts, '
+                  '$f^2$ for superscripts):')
+        try:
+            new_text, ok = QInputDialog.getMultiLineText(
+                self, 'Edit Annotation', prompt, old_text
+            )
+        except AttributeError:
+            new_text, ok = QInputDialog.getText(
+                self, 'Edit Annotation', prompt, text=old_text
+            )
+        if ok and new_text != old_text:
+            artist.set_text(new_text)
+            self.draw_idle()
+
+    # --- right-click to delete ---
+
+    def _show_annotation_context_menu(self, artist, event):
+        """Show a context menu with a Delete option for the annotation."""
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete annotation")
+
+        from matplotlib.text import Text, Annotation
+        if isinstance(artist, (Text, Annotation)):
+            edit_action = menu.addAction("Edit text\u2026")
+            font_action = menu.addAction("Font size\u2026")
+        else:
+            edit_action = None
+            font_action = None
+
+        qpoint = self._event_to_global(event)
+        try:
+            action = menu.exec_(qpoint)
+        except AttributeError:
+            action = menu.exec(qpoint)
+
+        if action == delete_action:
+            self._delete_annotation(artist)
+        elif edit_action is not None and action == edit_action:
+            self._edit_annotation_text(artist)
+        elif font_action is not None and action == font_action:
+            self._change_annotation_font_size(artist)
+
+    def _event_to_global(self, event):
+        """Convert a matplotlib mouse event to a global QPoint for menus."""
+        canvas_h = self.get_width_height()[1]
+        from matplotlib.backends.qt_compat import QtCore
+        local_pt = QtCore.QPoint(int(event.x), int(canvas_h - event.y))
+        return self.mapToGlobal(local_pt)
+
+    # --- per-annotation font size ---
+
+    def _change_annotation_font_size(self, artist):
+        """Prompt the user to change the font size of a single annotation."""
+        current = artist.get_fontsize()
+        new_size, ok = QInputDialog.getInt(
+            self, 'Annotation Font Size', 'Size (pt):',
+            int(current), 4, 48, 1
+        )
+        if ok:
+            artist.set_fontsize(new_size)
+            self.draw_idle()
+
+    # --- graph-wide font size menu ---
+
+    def _show_graph_context_menu(self, event):
+        """Right-click on empty canvas area → change graph-wide font sizes."""
+        menu = QMenu(self)
+        all_action  = menu.addAction("All font sizes\u2026")
+        menu.addSeparator()
+        title_action  = menu.addAction("Title font size\u2026")
+        label_action  = menu.addAction("Axis label font size\u2026")
+        tick_action   = menu.addAction("Tick label font size\u2026")
+        legend_action = menu.addAction("Legend font size\u2026")
+        ann_action    = menu.addAction("Annotation font size\u2026")
+
+        qpoint = self._event_to_global(event)
+        try:
+            action = menu.exec_(qpoint)
+        except AttributeError:
+            action = menu.exec(qpoint)
+
+        if action is None:
+            return
+
+        if action == all_action:
+            self._set_all_font_sizes()
+        elif action == title_action:
+            self._set_title_font_size()
+        elif action == label_action:
+            self._set_axis_label_font_size()
+        elif action == tick_action:
+            self._set_tick_font_size()
+        elif action == legend_action:
+            self._set_legend_font_size()
+        elif action == ann_action:
+            self._set_annotation_font_sizes()
+
+    def _set_all_font_sizes(self):
+        """Change every text element in the graph to a single font size."""
+        cur = int(plt.rcParams.get('font.size', 10))
+        size, ok = QInputDialog.getInt(
+            self, 'All Font Sizes', 'Size (pt):', cur, 4, 48, 1
+        )
+        if not ok:
+            return
+        # Title
+        self.ax.title.set_fontsize(size)
+        # Axis labels
+        self.ax.xaxis.label.set_fontsize(size)
+        self.ax.yaxis.label.set_fontsize(size)
+        # Tick labels
+        for lbl in self.ax.get_xticklabels() + self.ax.get_yticklabels():
+            lbl.set_fontsize(size)
+        # Legend
+        leg = self.ax.get_legend()
+        if leg is not None:
+            for txt in leg.get_texts():
+                txt.set_fontsize(size)
+        # All managed annotations
+        from matplotlib.text import Text, Annotation
+        for a in self._managed_annotations():
+            if isinstance(a, (Text, Annotation)):
+                a.set_fontsize(size)
+        # Update rcParams so future replots inherit the choice
+        plt.rcParams.update({
+            'font.size':        size,
+            'axes.labelsize':   size,
+            'axes.titlesize':   size,
+            'xtick.labelsize':  size,
+            'ytick.labelsize':  size,
+            'legend.fontsize':  size,
+        })
+        self.draw_idle()
+
+    def _set_title_font_size(self):
+        cur = int(self.ax.title.get_fontsize())
+        size, ok = QInputDialog.getInt(
+            self, 'Title Font Size', 'Size (pt):', cur, 4, 48, 1
+        )
+        if ok:
+            self.ax.title.set_fontsize(size)
+            plt.rcParams['axes.titlesize'] = size
+            self.draw_idle()
+
+    def _set_axis_label_font_size(self):
+        cur = int(self.ax.xaxis.label.get_fontsize())
+        size, ok = QInputDialog.getInt(
+            self, 'Axis Label Font Size', 'Size (pt):', cur, 4, 48, 1
+        )
+        if ok:
+            self.ax.xaxis.label.set_fontsize(size)
+            self.ax.yaxis.label.set_fontsize(size)
+            plt.rcParams['axes.labelsize'] = size
+            self.draw_idle()
+
+    def _set_tick_font_size(self):
+        labels = self.ax.get_xticklabels()
+        cur = int(labels[0].get_fontsize()) if labels else 9
+        size, ok = QInputDialog.getInt(
+            self, 'Tick Label Font Size', 'Size (pt):', cur, 4, 48, 1
+        )
+        if ok:
+            for lbl in self.ax.get_xticklabels() + self.ax.get_yticklabels():
+                lbl.set_fontsize(size)
+            plt.rcParams['xtick.labelsize'] = size
+            plt.rcParams['ytick.labelsize'] = size
+            self.draw_idle()
+
+    def _set_legend_font_size(self):
+        leg = self.ax.get_legend()
+        if leg is None:
+            return
+        texts = leg.get_texts()
+        cur = int(texts[0].get_fontsize()) if texts else 9
+        size, ok = QInputDialog.getInt(
+            self, 'Legend Font Size', 'Size (pt):', cur, 4, 48, 1
+        )
+        if ok:
+            for txt in texts:
+                txt.set_fontsize(size)
+            plt.rcParams['legend.fontsize'] = size
+            self.draw_idle()
+
+    def _set_annotation_font_sizes(self):
+        """Change font size of all managed annotation text at once."""
+        from matplotlib.text import Text, Annotation
+        ann_texts = [a for a in self._managed_annotations()
+                     if isinstance(a, (Text, Annotation))]
+        if not ann_texts:
+            return
+        cur = int(ann_texts[0].get_fontsize())
+        size, ok = QInputDialog.getInt(
+            self, 'Annotation Font Size', 'Size (pt):', cur, 4, 48, 1
+        )
+        if ok:
+            for a in ann_texts:
+                a.set_fontsize(size)
+            self.draw_idle()
+
+    # --- delete annotation ---
+
+    def _delete_annotation(self, artist):
+        """Remove a single annotation artist from the plot and bookkeeping."""
+        try:
+            artist.remove()
+        except Exception:
+            pass
+        # Remove from tracking lists
+        if hasattr(self, '_q_annotations') and artist in self._q_annotations:
+            self._q_annotations.remove(artist)
+        if hasattr(self, '_change_annotations') and artist in self._change_annotations:
+            self._change_annotations.remove(artist)
+        self.draw_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -2336,7 +2653,7 @@ class SNPViewerApp(QMainWindow):
             f0_str = f"{r['f0']:.6g}"
             bw_str = self.canvas._format_bw(r['bw'], unit)
             q_str  = f"{r['q']:.0f}"
-            entry = f"f0={f0_str} {unit}  BW={bw_str}  Q={q_str}"
+            entry = f"f\u2080={f0_str} {unit}  BW={bw_str}  Q={q_str}"
             if lbl and not lbl.startswith('_'):
                 entry = f"[{lbl}] " + entry
             parts.append(entry)
