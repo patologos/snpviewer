@@ -20,7 +20,8 @@ try:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QAction, QMessageBox,
-        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu
+        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
+        QDialog, QSpinBox, QFormLayout
     )
     from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize
     from PyQt5.QtGui import QIcon, QFont, QColor, QPalette, QCursor
@@ -33,7 +34,8 @@ except ImportError:
         QSplitter, QListWidget, QListWidgetItem, QPushButton, QGroupBox,
         QCheckBox, QGridLayout, QComboBox, QDoubleSpinBox, QLabel,
         QTabBar, QFileDialog, QStatusBar, QToolBar, QMessageBox,
-        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu
+        QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
+        QDialog, QSpinBox, QFormLayout
     )
     from PySide6.QtCore import Qt, Signal, QSize
     from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QCursor
@@ -49,6 +51,7 @@ from matplotlib.widgets import SpanSelector
 from scipy.signal import find_peaks
 
 import skrf as rf
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +293,12 @@ class NatureColors:
         """
         return NatureColors.LINESTYLES[file_idx % len(NatureColors.LINESTYLES)]
 
+    @classmethod
+    def set_palette(cls, palette_name):
+        colors = COLOR_PALETTES.get(palette_name, COLOR_PALETTES['Nature'])
+        cls.CYCLE = list(colors)
+        plt.rcParams['axes.prop_cycle'] = plt.cycler('color', cls.CYCLE)
+
     @staticmethod
     def apply_matplotlib_defaults():
         """Set matplotlib rcParams for Nature-style plots.
@@ -327,6 +336,43 @@ class NatureColors:
 
 
 # ---------------------------------------------------------------------------
+# Figure Size Presets
+# ---------------------------------------------------------------------------
+
+FIGURE_SIZE_PRESETS = [
+    # (label, width_inches, height_inches, font_scale)
+    ("Auto", None, None, 1.0),
+    ("Journal 1-col (89 mm)", 3.50, 2.625, 0.55),
+    ("Journal 1.5-col (140 mm)", 5.51, 4.13, 0.72),
+    ("Journal 2-col (183 mm)", 7.20, 5.40, 0.90),
+    ("Slide 4:3", 10.0, 7.5, 1.2),
+    ("Slide 16:9", 13.33, 7.5, 1.3),
+]
+
+# ---------------------------------------------------------------------------
+# Color Palette Definitions
+# ---------------------------------------------------------------------------
+
+COLOR_PALETTES = {
+    'Nature': ['#E64B35', '#3C5488', '#00A087', '#4DBBD5', '#F39B7F',
+               '#8491B4', '#91D1C2', '#DC0000', '#7E6148', '#B09C85'],
+    'IEEE':   ['#00549F', '#E30613', '#57A639', '#F6A800', '#612158',
+               '#0098A1', '#C4071B', '#8DC060', '#BDCD00', '#D85C00'],
+    'Colorblind (Wong)': ['#000000', '#E69F00', '#56B4E9', '#009E73',
+                          '#F0E442', '#0072B2', '#D55E00', '#CC79A7',
+                          '#999999', '#661100'],
+    'Tableau': ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F',
+                '#EDC948', '#B07AA1', '#FF9DA7', '#9C755F', '#BAB0AC'],
+    'Grayscale': ['#000000', '#333333', '#555555', '#777777', '#999999',
+                  '#AAAAAA', '#BBBBBB', '#CCCCCC', '#DDDDDD', '#EEEEEE'],
+}
+
+PALETTE_NAMES = list(COLOR_PALETTES.keys())
+
+MARKER_STYLES = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'p', 'h']
+
+
+# ---------------------------------------------------------------------------
 # Plot Canvas (matplotlib embedded in Qt)
 # ---------------------------------------------------------------------------
 
@@ -334,7 +380,7 @@ class PlotCanvas(FigureCanvasQTAgg):
     """Matplotlib canvas for plotting S-parameter data."""
 
     def __init__(self, parent=None):
-        self.fig = Figure(figsize=(8, 6), dpi=100, tight_layout=True)
+        self.fig = Figure(figsize=(8, 6), dpi=100, layout='constrained')
         super().__init__(self.fig)
         self.setParent(parent)
         self.ax = None
@@ -343,6 +389,12 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.mpl_connect('motion_notify_event', self._on_hover)
 
         # --- Interactive annotation support ---
+        self._grid_state = 0            # 0=None, 1=Major, 2=Major+Minor
+        self._markers_enabled = False
+        self._transparent_bg = False
+        self._cursor_mode = False
+        self._cursors = []              # list of {'x': float, 'artists': [...]}
+        self._cursor_delta_ann = None
         self._dragging_artist = None    # artist currently being dragged
         self._drag_offset = (0, 0)      # offset from click to artist origin
         self.mpl_connect('button_press_event', self._on_button_press)
@@ -375,9 +427,55 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_title(title, pad=10)
         self.ax.spines['top'].set_visible(False)
         self.ax.spines['right'].set_visible(False)
-        self.ax.legend(loc='best', frameon=True)
+        w, _ = self.fig.get_size_inches()
+        if w < 5.0:
+            self.ax.legend(
+                loc='upper center',
+                bbox_to_anchor=(0.5, -0.18),
+                ncol=2, frameon=True, fontsize=plt.rcParams['legend.fontsize'],
+            )
+        else:
+            self.ax.legend(loc='best', frameon=True)
         self.ax.set_facecolor('#F5F5F5')
-        self.ax.grid(False)
+
+        if self._grid_state == 0:
+            self.ax.grid(False)
+        elif self._grid_state == 1:
+            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
+                         color='#cccccc')
+        else:
+            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
+                         color='#cccccc')
+            self.ax.minorticks_on()
+            self.ax.grid(True, which='minor', alpha=0.3, linestyle=':',
+                         color='#cccccc')
+
+        if self._transparent_bg:
+            self.fig.patch.set_alpha(0)
+            self.ax.patch.set_alpha(0)
+            self.ax.set_facecolor('none')
+        else:
+            self.fig.patch.set_alpha(1.0)
+            self.ax.patch.set_alpha(1.0)
+
+        if self._markers_enabled:
+            for i, ln in enumerate(self.ax.lines):
+                lbl = ln.get_label() or ''
+                if lbl.startswith('_'):
+                    continue
+                xd = ln.get_xdata()
+                if xd is None or len(xd) <= 2:
+                    continue
+                n_pts = len(xd)
+                every = max(1, n_pts // 12)
+                marker = MARKER_STYLES[i % len(MARKER_STYLES)]
+                ln.set_marker(marker)
+                ln.set_markevery(every)
+                ln.set_markersize(5)
+                ln.set_markeredgewidth(0.8)
+                ln.set_markerfacecolor(ln.get_color())
+                ln.set_markeredgecolor('white')
+
         self._apply_aspect()
 
     def _apply_aspect(self):
@@ -453,9 +551,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 s_mag = np.abs(mem_net.s[:, m, n])
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
-                lbl = f'MEM {mem_name} S{m+1}{n+1}'
+                lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
                 self.ax.plot(freq_m, s_db,
-                             color='#AAAAAA', linewidth=1.4,
+                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
                              linestyle='--', label=lbl, alpha=0.75)
 
         for file_idx, (name, network) in enumerate(networks):
@@ -481,9 +579,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
 
                 if not diff_only:
-                    label = f'{name} S{m+1}{n+1}'
+                    label = f'{name} $S_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, s_db, color=color,
-                                 label=label, linewidth=1.8,
+                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=linestyle)
 
                 # Differential trace (skip when this network is the memory itself)
@@ -491,9 +589,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                     diff_raw = s_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} S{m+1}{n+1}'
+                    diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=1.8,
+                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=':', alpha=0.9)
 
                 trace_idx += 1
@@ -528,9 +626,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 z_mag = np.abs(mem_net.z[:, m, n])
                 z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
-                lbl = f'MEM {mem_name} Z{m+1}{n+1}'
+                lbl = f'MEM {mem_name} $Z_{{{m+1}{n+1}}}$'
                 self.ax.plot(freq_m, z_db,
-                             color='#AAAAAA', linewidth=1.4,
+                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
                              linestyle='--', label=lbl, alpha=0.75)
 
         for file_idx, (name, network) in enumerate(networks):
@@ -548,22 +646,22 @@ class PlotCanvas(FigureCanvasQTAgg):
                 z_mag = np.abs(z_raw)
                 z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
                 if not diff_only:
-                    label = f'{name} Z{m+1}{n+1}'
+                    label = f'{name} $Z_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, z_db, color=color,
-                                 label=label, linewidth=1.8,
+                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     diff_raw = z_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} Z{m+1}{n+1}'
+                    diff_lbl = f'\u0394{name} $Z_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=1.8,
+                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
-        self.ax.set_ylabel('|Z| (dB\u03A9)')
+        self.ax.set_ylabel('$|Z|$ (dB$\\Omega$)')
         self._style_axes()
         self.draw()
 
@@ -592,9 +690,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 y_mag = np.abs(mem_net.y[:, m, n])
                 y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
-                lbl = f'MEM {mem_name} Y{m+1}{n+1}'
+                lbl = f'MEM {mem_name} $Y_{{{m+1}{n+1}}}$'
                 self.ax.plot(freq_m, y_db,
-                             color='#AAAAAA', linewidth=1.4,
+                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
                              linestyle='--', label=lbl, alpha=0.75)
 
         for file_idx, (name, network) in enumerate(networks):
@@ -612,22 +710,22 @@ class PlotCanvas(FigureCanvasQTAgg):
                 y_mag = np.abs(y_raw)
                 y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
                 if not diff_only:
-                    label = f'{name} Y{m+1}{n+1}'
+                    label = f'{name} $Y_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, y_db, color=color,
-                                 label=label, linewidth=1.8,
+                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     diff_raw = y_raw - mem_interp[:, m, n]
                     diff_mag = np.abs(diff_raw)
                     diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} Y{m+1}{n+1}'
+                    diff_lbl = f'\u0394{name} $Y_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=1.8,
+                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
-        self.ax.set_ylabel('|Y| (dBS)')
+        self.ax.set_ylabel('$|Y|$ (dBS)')
         self._style_axes()
         self.draw()
 
@@ -654,9 +752,9 @@ class PlotCanvas(FigureCanvasQTAgg):
             for m, n in param_list:
                 if m >= n_ports_m or n >= n_ports_m:
                     continue
-                lbl = f'MEM {mem_name} S{m+1}{n+1}'
+                lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
                 self.ax.plot(freq_m, mem_net.s_deg[:, m, n],
-                             color='#AAAAAA', linewidth=1.4,
+                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
                              linestyle='--', label=lbl, alpha=0.75)
 
         for file_idx, (name, network) in enumerate(networks):
@@ -672,16 +770,16 @@ class PlotCanvas(FigureCanvasQTAgg):
                 linestyle = NatureColors.get_linestyle(file_idx)
                 s_deg = network.s_deg[:, m, n]
                 if not diff_only:
-                    label = f'{name} S{m+1}{n+1}'
+                    label = f'{name} $S_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, s_deg, color=color,
-                                 label=label, linewidth=1.8,
+                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=linestyle)
                 if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
                     mem_deg = np.degrees(np.angle(mem_interp[:, m, n]))
                     diff_deg = s_deg - mem_deg
-                    diff_lbl = f'\u0394{name} S{m+1}{n+1}'
+                    diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq, diff_deg, color=color,
-                                 label=diff_lbl, linewidth=1.8,
+                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
                                  linestyle=':', alpha=0.9)
                 trace_idx += 1
 
@@ -709,16 +807,25 @@ class PlotCanvas(FigureCanvasQTAgg):
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                label = f'{name} S{m+1}{n+1}'
+                label = f'{name} $S_{{{m+1}{n+1}}}$'
                 network.plot_s_smith(
                     m=m, n=n, ax=self.ax, color=color,
-                    label=label, linewidth=1.8,
+                    label=label, linewidth=plt.rcParams['lines.linewidth'],
                     draw_labels=(not first_drawn), chart_type='z'
                 )
                 first_drawn = True
                 trace_idx += 1
 
-        self.ax.legend(loc='upper right', frameon=True)
+        w, _ = self.fig.get_size_inches()
+        if w < 5.0:
+            self.ax.legend(
+                loc='upper center',
+                bbox_to_anchor=(0.5, -0.05),
+                ncol=2, frameon=True,
+                fontsize=plt.rcParams['legend.fontsize'],
+            )
+        else:
+            self.ax.legend(loc='upper right', frameon=True)
         self._apply_aspect()
         self.draw()
 
@@ -747,9 +854,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                 s_mag = np.abs(network.s[:, m, n])
                 vswr = (1 + s_mag) / (1 - s_mag)
                 vswr = np.clip(vswr, 1, 100)
-                label = f'{name} VSWR(S{m+1}{n+1})'
+                label = f'{name} VSWR($S_{{{m+1}{n+1}}}$)'
                 self.ax.plot(freq, vswr, color=color,
-                             label=label, linewidth=1.8,
+                             label=label, linewidth=plt.rcParams['lines.linewidth'],
                              linestyle=NatureColors.get_linestyle(file_idx))
                 trace_idx += 1
 
@@ -791,9 +898,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                     continue
                 gd = _group_delay_ns(mem_net, m, n)
                 if gd is not None:
-                    lbl = f'MEM {mem_name} S{m+1}{n+1}'
+                    lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
                     self.ax.plot(freq_m, gd,
-                                 color='#AAAAAA', linewidth=1.4,
+                                 color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
                                  linestyle='--', label=lbl, alpha=0.75)
 
         for file_idx, (name, network) in enumerate(networks):
@@ -810,9 +917,9 @@ class PlotCanvas(FigureCanvasQTAgg):
                 gd = _group_delay_ns(network, m, n)
                 if gd is not None:
                     if not diff_only:
-                        label = f'{name} S{m+1}{n+1}'
+                        label = f'{name} $S_{{{m+1}{n+1}}}$'
                         self.ax.plot(freq, gd, color=color,
-                                     label=label, linewidth=1.8,
+                                     label=label, linewidth=plt.rcParams['lines.linewidth'],
                                      linestyle=linestyle)
                     if (mem_interp is not None
                             and m < mem_interp.shape[1]
@@ -821,15 +928,121 @@ class PlotCanvas(FigureCanvasQTAgg):
                         mem_phase_rad = np.unwrap(np.angle(mem_interp[:, m, n]))
                         omega = 2 * np.pi * network.frequency.f
                         mem_gd = -np.gradient(mem_phase_rad, omega) * 1e9
-                        diff_lbl = f'\u0394{name} S{m+1}{n+1}'
+                        diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
                         self.ax.plot(freq, gd - mem_gd, color=color,
-                                     label=diff_lbl, linewidth=1.8,
+                                     label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
                                      linestyle=':', alpha=0.9)
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Group Delay (ns)')
         self._style_axes()
+        self.draw()
+
+    def plot_mag_phase(self, networks, param_list,
+                       mem_network=None, diff_only=False):
+        """Plot magnitude (left y-axis) and phase (right y-axis) overlaid."""
+        self._clear_fig()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        trace_idx = 0
+        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
+
+        ax2 = self.ax.twinx()
+        self._ax2 = ax2
+
+        mag_handles, mag_labels = [], []
+        phase_handles, phase_labels = [], []
+
+        for file_idx, (name, network) in enumerate(networks):
+            freq, _ = auto_freq_scale(network.frequency.f)
+            n_ports = network.number_of_ports
+
+            for m, n in param_list:
+                if m >= n_ports or n >= n_ports:
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                linestyle = NatureColors.get_linestyle(file_idx)
+
+                s_mag = np.abs(network.s[:, m, n])
+                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
+                mag_lbl = f'{name} $|S_{{{m+1}{n+1}}}|$'
+                h_mag, = self.ax.plot(freq, s_db, color=color,
+                                      label=mag_lbl,
+                                      linewidth=plt.rcParams['lines.linewidth'],
+                                      linestyle=linestyle)
+                mag_handles.append(h_mag)
+                mag_labels.append(mag_lbl)
+
+                s_deg = network.s_deg[:, m, n]
+                phase_lbl = f'{name} $\\angle S_{{{m+1}{n+1}}}$'
+                h_phase, = ax2.plot(freq, s_deg, color=color,
+                                    label=phase_lbl,
+                                    linewidth=plt.rcParams['lines.linewidth'],
+                                    linestyle='--', alpha=0.7)
+                phase_handles.append(h_phase)
+                phase_labels.append(phase_lbl)
+
+                trace_idx += 1
+
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel('Magnitude (dB)')
+        ax2.set_ylabel('Phase (degrees)')
+
+        self.ax.set_title('', pad=10)
+        self.ax.spines['top'].set_visible(False)
+        ax2.spines['top'].set_visible(False)
+        self.ax.set_facecolor('#F5F5F5')
+
+        if self._grid_state >= 1:
+            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
+                         color='#cccccc')
+        if self._grid_state >= 2:
+            self.ax.minorticks_on()
+            self.ax.grid(True, which='minor', alpha=0.3, linestyle=':',
+                         color='#cccccc')
+
+        if self._transparent_bg:
+            self.fig.patch.set_alpha(0)
+            self.ax.patch.set_alpha(0)
+            self.ax.set_facecolor('none')
+        else:
+            self.fig.patch.set_alpha(1.0)
+            self.ax.patch.set_alpha(1.0)
+
+        if mag_handles:
+            self.ax.legend(mag_handles, mag_labels,
+                           loc='upper left', frameon=True,
+                           fontsize=plt.rcParams['legend.fontsize'])
+        if phase_handles:
+            ax2.legend(phase_handles, phase_labels,
+                       loc='upper right', frameon=True,
+                       fontsize=plt.rcParams['legend.fontsize'])
+
+        if self._markers_enabled:
+            all_lines = list(self.ax.lines) + list(ax2.lines)
+            for i, ln in enumerate(all_lines):
+                lbl = ln.get_label() or ''
+                if lbl.startswith('_'):
+                    continue
+                xd = ln.get_xdata()
+                if xd is None or len(xd) <= 2:
+                    continue
+                n_pts = len(xd)
+                every = max(1, n_pts // 12)
+                marker = MARKER_STYLES[i % len(MARKER_STYLES)]
+                ln.set_marker(marker)
+                ln.set_markevery(every)
+                ln.set_markersize(5)
+                ln.set_markeredgewidth(0.8)
+                ln.set_markerfacecolor(ln.get_color())
+                ln.set_markeredgecolor('white')
+
+        self._apply_aspect()
         self.draw()
 
     def _show_no_params(self):
@@ -1157,7 +1370,7 @@ class PlotCanvas(FigureCanvasQTAgg):
             # Vertical line at f0 (solid)
             self._q_annotations.append(
                 self.ax.axvline(f0, color=c, linestyle='-',
-                                linewidth=1.4, alpha=0.75, picker=5)
+                                linewidth=plt.rcParams['lines.linewidth'] * 0.78, alpha=0.75, picker=5)
             )
             # Vertical lines at 3 dB crossings (dotted)
             self._q_annotations.append(
@@ -1408,7 +1621,12 @@ class PlotCanvas(FigureCanvasQTAgg):
         """Return the combined list of all editable annotation artists."""
         q = getattr(self, '_q_annotations', [])
         ch = getattr(self, '_change_annotations', [])
-        return q + ch
+        cu = []
+        for c in getattr(self, '_cursors', []):
+            cu.extend(c.get('artists', []))
+        delta = [getattr(self, '_cursor_delta_ann', None)]
+        delta = [a for a in delta if a is not None]
+        return q + ch + cu + delta
 
     def _hit_annotation(self, event):
         """Return the first managed annotation artist under *event*, or None."""
@@ -1429,6 +1647,11 @@ class PlotCanvas(FigureCanvasQTAgg):
         """Handle mouse button press for drag / double-click / right-click."""
         if self.ax is None or event.inaxes != self.ax:
             return
+
+        if event.button == 1 and self._cursor_mode and not event.dblclick:
+            if self._hit_annotation(event) is None:
+                self._place_cursor(event)
+                return
 
         hit = self._hit_annotation(event)
 
@@ -1722,6 +1945,155 @@ class PlotCanvas(FigureCanvasQTAgg):
             self._change_annotations.remove(artist)
         self.draw_idle()
 
+    # ------------------------------------------------------------------
+    # Draggable frequency cursors
+    # ------------------------------------------------------------------
+
+    def set_cursor_mode(self, enabled):
+        self._cursor_mode = bool(enabled)
+        if enabled:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _place_cursor(self, event):
+        if self.ax is None or event.xdata is None:
+            return
+
+        best_x = event.xdata
+        best_dist = float('inf')
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            if xd is None or len(xd) <= 2:
+                continue
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue
+            xd = np.asarray(xd, dtype=float)
+            dists = np.abs(xd - event.xdata)
+            idx = int(np.argmin(dists))
+            if dists[idx] < best_dist:
+                best_dist = dists[idx]
+                best_x = xd[idx]
+
+        cursor_idx = len(self._cursors) % 2
+        if cursor_idx < len(self._cursors):
+            self._remove_cursor(cursor_idx)
+
+        artists = []
+        f_unit = self._get_freq_unit()
+
+        vline = self.ax.axvline(best_x, color='#555555', linestyle='--',
+                                linewidth=1.0, alpha=0.8, zorder=10)
+        artists.append(vline)
+
+        readout_lines = [f'C{cursor_idx + 1}: {best_x:.6g} {f_unit}']
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if xd is None or len(xd) <= 2:
+                continue
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue
+            xd = np.asarray(xd, dtype=float)
+            yd = np.asarray(yd, dtype=float)
+            idx = int(np.argmin(np.abs(xd - best_x)))
+            val = yd[idx]
+            readout_lines.append(f'  {lbl}: {val:.4g}')
+
+        readout_text = '\n'.join(readout_lines)
+        y_pos = 0.95 - cursor_idx * 0.35
+        x_pos = 0.98 if cursor_idx == 1 else 0.02
+        ha = 'right' if cursor_idx == 1 else 'left'
+
+        ann = self.ax.text(
+            x_pos, y_pos, readout_text,
+            transform=self.ax.transAxes,
+            fontsize=8, verticalalignment='top',
+            horizontalalignment=ha,
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow',
+                      edgecolor='#555555', alpha=0.93),
+            zorder=20, picker=True,
+        )
+        artists.append(ann)
+
+        if cursor_idx < len(self._cursors):
+            self._cursors[cursor_idx] = {'x': best_x, 'artists': artists}
+        else:
+            self._cursors.append({'x': best_x, 'artists': artists})
+
+        self._update_cursor_delta()
+        self.draw_idle()
+
+    def _remove_cursor(self, idx):
+        if idx < len(self._cursors):
+            for a in self._cursors[idx]['artists']:
+                try:
+                    a.remove()
+                except Exception:
+                    pass
+        self._clear_cursor_delta()
+
+    def _update_cursor_delta(self):
+        self._clear_cursor_delta()
+        if len(self._cursors) < 2:
+            return
+
+        x1 = self._cursors[0]['x']
+        x2 = self._cursors[1]['x']
+        f_unit = self._get_freq_unit()
+        delta_f = abs(x2 - x1)
+
+        delta_lines = [f'Δf = {delta_f:.6g} {f_unit}']
+        for ln in self.ax.lines:
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if xd is None or len(xd) <= 2:
+                continue
+            lbl = ln.get_label() or ''
+            if lbl.startswith('_'):
+                continue
+            xd = np.asarray(xd, dtype=float)
+            yd = np.asarray(yd, dtype=float)
+            idx1 = int(np.argmin(np.abs(xd - x1)))
+            idx2 = int(np.argmin(np.abs(xd - x2)))
+            dval = yd[idx2] - yd[idx1]
+            delta_lines.append(f'  Δ{lbl}: {dval:+.4g}')
+
+        delta_text = '\n'.join(delta_lines)
+        self._cursor_delta_ann = self.ax.text(
+            0.5, 0.02, delta_text,
+            transform=self.ax.transAxes,
+            fontsize=8, verticalalignment='bottom',
+            horizontalalignment='center',
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFFFDD',
+                      edgecolor='#888888', alpha=0.93),
+            zorder=20, picker=True,
+        )
+
+    def _clear_cursor_delta(self):
+        ann = getattr(self, '_cursor_delta_ann', None)
+        if ann is not None:
+            try:
+                ann.remove()
+            except Exception:
+                pass
+            self._cursor_delta_ann = None
+
+    def clear_all_cursors(self):
+        for c in self._cursors:
+            for a in c['artists']:
+                try:
+                    a.remove()
+                except Exception:
+                    pass
+        self._cursors = []
+        self._clear_cursor_delta()
+        self.draw_idle()
+
 
 # ---------------------------------------------------------------------------
 # File List Widget
@@ -1735,6 +2107,7 @@ class FileListWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._networks = {}  # item_text -> (short_name, Network)
+        self._filepaths = {}  # item_text -> filepath
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self.setAlternatingRowColors(True)
@@ -1779,6 +2152,7 @@ class FileListWidget(QListWidget):
             display = f"{display} ({filepath})"
 
         self._networks[display] = (basename, network)
+        self._filepaths[display] = filepath
         item = QListWidgetItem(display)
         item.setToolTip(
             f"File: {filepath}\n"
@@ -1796,6 +2170,7 @@ class FileListWidget(QListWidget):
         for item in self.selectedItems():
             text = item.text()
             self._networks.pop(text, None)
+            self._filepaths.pop(text, None)
             self.takeItem(self.row(item))
 
     def get_selected_networks(self):
@@ -1822,6 +2197,28 @@ class FileListWidget(QListWidget):
 
     def get_network_count(self):
         return len(self._networks)
+
+    def get_all_filepaths(self):
+        """Return ordered list of file paths for all loaded files."""
+        return [self._filepaths.get(self.item(i).text(), '')
+                for i in range(self.count())]
+
+    def get_selected_indices(self):
+        """Return sorted list of selected item indices."""
+        return sorted(self.row(item) for item in self.selectedItems())
+
+    def select_by_indices(self, indices):
+        """Clear current selection and select items by index."""
+        self.clearSelection()
+        for i in indices:
+            if 0 <= i < self.count():
+                self.item(i).setSelected(True)
+
+    def clear_all(self):
+        """Remove all files."""
+        self._networks.clear()
+        self._filepaths.clear()
+        self.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2120,6 +2517,7 @@ class SNPViewerApp(QMainWindow):
     PLOT_SMITH = 2
     PLOT_VSWR = 3
     PLOT_GROUP_DELAY = 4
+    PLOT_MAG_PHASE = 5
 
     # Parameter types that show a magnitude (dB) plot and support Q measurement
     _MAGNITUDE_PLOTS = {PLOT_MAGNITUDE}
@@ -2130,11 +2528,19 @@ class SNPViewerApp(QMainWindow):
         self.resize(1200, 750)
         self.setAcceptDrops(True)
 
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'snpviewer.ico')
+        if os.path.isfile(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
         self._param_type = settings.param_type   # 'S', 'Z', or 'Y'
 
         # Math Memory state
         self._mem_network = None   # (short_name, Network) or None
         self._diff_only = False    # Show differential traces only
+        self._grid_state = 0
+        self._palette_name = 'Nature'
+        self._markers_enabled = False
 
         NatureColors.apply_matplotlib_defaults()
         self._build_ui()
@@ -2252,6 +2658,7 @@ class SNPViewerApp(QMainWindow):
         self.plot_tab_bar.addTab("Smith Chart")
         self.plot_tab_bar.addTab("VSWR")
         self.plot_tab_bar.addTab("Group Delay")
+        self.plot_tab_bar.addTab("Mag + Phase")
         self.plot_tab_bar.setStyleSheet(f"""
             QTabBar::tab {{
                 padding: 6px 16px;
@@ -2313,6 +2720,25 @@ class SNPViewerApp(QMainWindow):
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(self._on_save)
         file_menu.addAction(save_action)
+
+        file_menu.addSeparator()
+
+        save_session_action = QAction("Save Session...", self)
+        save_session_action.setShortcut("Ctrl+Shift+S")
+        save_session_action.triggered.connect(self._save_session)
+        file_menu.addAction(save_session_action)
+
+        load_session_action = QAction("Load Session...", self)
+        load_session_action.setShortcut("Ctrl+Shift+O")
+        load_session_action.triggered.connect(self._load_session)
+        file_menu.addAction(load_session_action)
+
+        file_menu.addSeparator()
+
+        export_action = QAction("&Export Figure...", self)
+        export_action.setShortcut("Ctrl+E")
+        export_action.triggered.connect(self._on_export_figure)
+        file_menu.addAction(export_action)
 
         file_menu.addSeparator()
 
@@ -2486,6 +2912,80 @@ class SNPViewerApp(QMainWindow):
         self.square_action.triggered.connect(self._on_square_toggled)
         toolbar.addAction(self.square_action)
 
+        self.grid_action = QAction("Grid", self)
+        self.grid_action.setToolTip(
+            "Cycle grid: None → Major → Major+Minor → None"
+        )
+        self.grid_action.triggered.connect(self._on_grid_toggled)
+        toolbar.addAction(self.grid_action)
+
+        self.transparent_action = QAction("Transparent", self)
+        self.transparent_action.setCheckable(True)
+        self.transparent_action.setChecked(False)
+        self.transparent_action.setToolTip(
+            "Toggle transparent background for export preview"
+        )
+        self.transparent_action.triggered.connect(self._on_transparent_toggled)
+        toolbar.addAction(self.transparent_action)
+
+        self.markers_action = QAction("Markers", self)
+        self.markers_action.setCheckable(True)
+        self.markers_action.setChecked(False)
+        self.markers_action.setToolTip("Add marker shapes to distinguish traces")
+        self.markers_action.triggered.connect(self._on_markers_toggled)
+        toolbar.addAction(self.markers_action)
+
+        toolbar.addSeparator()
+
+        self.cursor_action = QAction("Cursor", self)
+        self.cursor_action.setCheckable(True)
+        self.cursor_action.setChecked(False)
+        self.cursor_action.setToolTip(
+            "Click on the plot to place frequency cursors (max 2).\n"
+            "With 2 cursors, delta values are shown."
+        )
+        self.cursor_action.triggered.connect(self._on_cursor_toggled)
+        toolbar.addAction(self.cursor_action)
+
+        self.clear_cursors_action = QAction("Clear Cursors", self)
+        self.clear_cursors_action.setToolTip("Remove all frequency cursors")
+        self.clear_cursors_action.triggered.connect(self._on_clear_cursors)
+        toolbar.addAction(self.clear_cursors_action)
+
+        toolbar.addSeparator()
+
+        size_label = QLabel(" Figure: ")
+        size_label.setStyleSheet("font-size: 9pt;")
+        toolbar.addWidget(size_label)
+        self.figsize_combo = QComboBox()
+        for label, _, _, _ in FIGURE_SIZE_PRESETS:
+            self.figsize_combo.addItem(label)
+        self.figsize_combo.setToolTip(
+            "Set figure dimensions for export.\n"
+            "The canvas matches the physical size at 100 DPI.\n"
+            "Use the matplotlib save button to export at higher DPI."
+        )
+        self.figsize_combo.setStyleSheet("font-size: 9pt; padding: 2px 4px;")
+        self.figsize_combo.currentIndexChanged.connect(
+            self._on_figure_size_changed
+        )
+        toolbar.addWidget(self.figsize_combo)
+
+        toolbar.addSeparator()
+
+        palette_label = QLabel(" Palette: ")
+        palette_label.setStyleSheet("font-size: 9pt;")
+        toolbar.addWidget(palette_label)
+        self.palette_combo = QComboBox()
+        for name in PALETTE_NAMES:
+            self.palette_combo.addItem(name)
+        self.palette_combo.setToolTip("Select the trace color palette")
+        self.palette_combo.setStyleSheet("font-size: 9pt; padding: 2px 4px;")
+        self.palette_combo.currentIndexChanged.connect(
+            self._on_palette_changed
+        )
+        toolbar.addWidget(self.palette_combo)
+
     def _connect_signals(self):
         """Wire up all signals and slots."""
         self.file_list.selection_updated.connect(self._on_selection_changed)
@@ -2572,6 +3072,9 @@ class SNPViewerApp(QMainWindow):
             self.canvas._q_span = None
         self.canvas._clear_q_annotations()
         self.canvas._clear_change_annotations()
+        self.canvas.clear_all_cursors()
+        self.cursor_action.setChecked(False)
+        self.canvas.set_cursor_mode(False)
         self.q_action.setChecked(False)
         self.clear_q_action.setEnabled(False)
         self.clear_changes_action.setEnabled(False)
@@ -2603,6 +3106,8 @@ class SNPViewerApp(QMainWindow):
             self.canvas.plot_vswr(networks, params)
         elif plot_type == self.PLOT_GROUP_DELAY:
             self.canvas.plot_group_delay(networks, params, **mem_kw)
+        elif plot_type == self.PLOT_MAG_PHASE:
+            self.canvas.plot_mag_phase(networks, params, **mem_kw)
 
     def _on_param_type_changed(self, param_type):
         """Switch between S, Z, and Y parameter display."""
@@ -2839,6 +3344,340 @@ class SNPViewerApp(QMainWindow):
         self.canvas.set_square_aspect(checked)
         self._update_status(
             "Square plot area." if checked else "Free plot area."
+        )
+
+    def _on_figure_size_changed(self, index):
+        """Apply a figure size preset or restore auto-fill."""
+        if index < 0 or index >= len(FIGURE_SIZE_PRESETS):
+            return
+        _, w, h, font_scale = FIGURE_SIZE_PRESETS[index]
+
+        plt.rcParams.update({
+            'font.size': max(4, round(settings.font_size * font_scale)),
+            'axes.labelsize': max(4, round(settings.label_size * font_scale)),
+            'axes.titlesize': max(4, round(settings.title_size * font_scale)),
+            'xtick.labelsize': max(4, round(settings.tick_size * font_scale)),
+            'ytick.labelsize': max(4, round(settings.tick_size * font_scale)),
+            'legend.fontsize': max(4, round(settings.legend_size * font_scale)),
+            'lines.linewidth': max(0.6, 1.8 * font_scale),
+            'axes.linewidth': max(0.4, 0.8 * font_scale),
+            'xtick.major.size': max(2, 4 * font_scale),
+            'ytick.major.size': max(2, 4 * font_scale),
+        })
+
+        if w is None:
+            self.canvas.setSizePolicy(
+                QSizePolicy.Expanding, QSizePolicy.Expanding
+            )
+            self.canvas.setMinimumSize(0, 0)
+            self.canvas.setMaximumSize(16777215, 16777215)
+            self.canvas.updateGeometry()
+            self._update_status("Figure size: auto (fills window)")
+        else:
+            dpi = self.canvas.fig.dpi
+            self.canvas.setFixedSize(int(w * dpi), int(h * dpi))
+            self._update_status(
+                f"Figure: {w:.2f}″ × {h:.2f}″ "
+                f"({w * 25.4:.0f} × {h * 25.4:.0f} mm)"
+            )
+        self._replot()
+
+    def _on_grid_toggled(self):
+        self._grid_state = (self._grid_state + 1) % 3
+        self.canvas._grid_state = self._grid_state
+        labels = {0: 'Grid: off', 1: 'Grid: major', 2: 'Grid: major + minor'}
+        self._update_status(labels[self._grid_state])
+        self._replot()
+
+    def _on_transparent_toggled(self, checked):
+        self.canvas._transparent_bg = checked
+        self._replot()
+        self._update_status(
+            "Transparent background ON." if checked
+            else "Transparent background OFF."
+        )
+
+    def _on_markers_toggled(self, checked):
+        self._markers_enabled = checked
+        self.canvas._markers_enabled = checked
+        self._replot()
+        self._update_status(
+            "Markers enabled." if checked else "Markers disabled."
+        )
+
+    def _on_palette_changed(self, index):
+        if index < 0 or index >= len(PALETTE_NAMES):
+            return
+        self._palette_name = PALETTE_NAMES[index]
+        NatureColors.set_palette(self._palette_name)
+        self._replot()
+        self._update_status(f"Palette: {self._palette_name}")
+
+    def _on_cursor_toggled(self, checked):
+        self.canvas.set_cursor_mode(checked)
+        self._update_status(
+            "Cursor mode: click on the plot to place cursors."
+            if checked else "Cursor mode off."
+        )
+
+    def _on_clear_cursors(self):
+        self.canvas.clear_all_cursors()
+        self.cursor_action.setChecked(False)
+        self.canvas.set_cursor_mode(False)
+        self._update_status("Cursors cleared.")
+
+    def _on_export_figure(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export Figure")
+        dlg.setMinimumWidth(320)
+        layout = QFormLayout(dlg)
+
+        format_combo = QComboBox()
+        format_combo.addItems(['PNG', 'PDF', 'SVG', 'EPS'])
+        layout.addRow("Format:", format_combo)
+
+        dpi_spin = QSpinBox()
+        dpi_spin.setRange(72, 1200)
+        dpi_spin.setValue(300)
+        dpi_spin.setSuffix(" DPI")
+        layout.addRow("Resolution:", dpi_spin)
+
+        cur_w, cur_h = self.canvas.fig.get_size_inches()
+        width_spin = QDoubleSpinBox()
+        width_spin.setRange(1.0, 40.0)
+        width_spin.setValue(cur_w)
+        width_spin.setDecimals(2)
+        width_spin.setSuffix(" in")
+        layout.addRow("Width:", width_spin)
+
+        height_spin = QDoubleSpinBox()
+        height_spin.setRange(1.0, 40.0)
+        height_spin.setValue(cur_h)
+        height_spin.setDecimals(2)
+        height_spin.setSuffix(" in")
+        layout.addRow("Height:", height_spin)
+
+        transparent_cb = QCheckBox("Transparent background")
+        transparent_cb.setChecked(self.canvas._transparent_bg)
+        layout.addRow(transparent_cb)
+
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("Export")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(export_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addRow(btn_row)
+
+        cancel_btn.clicked.connect(dlg.reject)
+
+        def do_export():
+            fmt = format_combo.currentText().lower()
+            ext_map = {'png': '.png', 'pdf': '.pdf', 'svg': '.svg', 'eps': '.eps'}
+            ext = ext_map.get(fmt, '.png')
+            default_name = f"figure{ext}"
+            filter_str = f"{fmt.upper()} Files (*{ext});;All Files (*)"
+
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, "Export Figure", default_name, filter_str
+            )
+            if not path:
+                return
+
+            dpi = dpi_spin.value()
+            w = width_spin.value()
+            h = height_spin.value()
+            transparent = transparent_cb.isChecked()
+
+            old_size = self.canvas.fig.get_size_inches()
+            self.canvas.fig.set_size_inches(w, h)
+            try:
+                self.canvas.fig.savefig(
+                    path, dpi=dpi, transparent=transparent,
+                    bbox_inches='tight', format=fmt
+                )
+                self._update_status(
+                    f"Exported {fmt.upper()} at {dpi} DPI to "
+                    f"{os.path.basename(path)}"
+                )
+                dlg.accept()
+            except Exception as e:
+                QMessageBox.warning(
+                    dlg, "Export Error", f"Failed to export:\n{e}"
+                )
+            finally:
+                self.canvas.fig.set_size_inches(*old_size)
+                self.canvas.draw_idle()
+
+        export_btn.clicked.connect(do_export)
+        dlg.exec_() if hasattr(dlg, 'exec_') else dlg.exec()
+
+    def _save_session(self):
+        """Save the current application state to a JSON file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Session", "session.json",
+            "Session Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        mem_idx = None
+        if self._mem_network is not None:
+            for i in range(self.file_list.count()):
+                entry = self.file_list._networks.get(
+                    self.file_list.item(i).text()
+                )
+                if entry and entry[1] is self._mem_network[1]:
+                    mem_idx = i
+                    break
+
+        state = {
+            "version": 2,
+            "files": self.file_list.get_all_filepaths(),
+            "selected_indices": self.file_list.get_selected_indices(),
+            "param_type": self._param_type,
+            "checked_params": self.param_selector.get_selected_params(),
+            "plot_tab": self.plot_tab_bar.currentIndex(),
+            "figure_size_idx": self.figsize_combo.currentIndex(),
+            "square_aspect": self.square_action.isChecked(),
+            "diff_only": self._diff_only,
+            "mem_index": mem_idx,
+            "grid_state": self._grid_state,
+            "palette_name": self._palette_name,
+            "markers_enabled": self._markers_enabled,
+        }
+
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2)
+            self._update_status(f"Session saved to {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Save Session", f"Failed to save:\n{e}"
+            )
+
+    def _load_session(self):
+        """Load application state from a JSON session file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Session", "",
+            "Session Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Load Session", f"Failed to read:\n{e}"
+            )
+            return
+
+        self.file_list.clear_all()
+        self._mem_network = None
+        self._diff_only = False
+
+        errors = []
+        for fp in state.get("files", []):
+            if os.path.isfile(fp):
+                ok, err = self.file_list.add_network(fp)
+                if not ok:
+                    errors.append(f"{os.path.basename(fp)}: {err}")
+            else:
+                errors.append(f"{os.path.basename(fp)}: file not found")
+
+        if errors:
+            QMessageBox.warning(
+                self, "Load Session",
+                "Some files could not be loaded:\n\n" + "\n".join(errors)
+            )
+
+        self.file_list.select_by_indices(
+            state.get("selected_indices", [])
+        )
+
+        pt = state.get("param_type", "S")
+        self._on_param_type_changed(pt)
+
+        checked = state.get("checked_params", [])
+        if checked:
+            checked_set = {(p[0], p[1]) for p in checked}
+            for cb in self.param_selector._checkboxes:
+                key = (cb.property('row'), cb.property('col'))
+                cb.blockSignals(True)
+                cb.setChecked(key in checked_set)
+                cb.blockSignals(False)
+
+        self.plot_tab_bar.blockSignals(True)
+        self.plot_tab_bar.setCurrentIndex(state.get("plot_tab", 0))
+        self.plot_tab_bar.blockSignals(False)
+
+        fig_idx = state.get("figure_size_idx", 0)
+        if 0 <= fig_idx < len(FIGURE_SIZE_PRESETS):
+            self.figsize_combo.blockSignals(True)
+            self.figsize_combo.setCurrentIndex(fig_idx)
+            self.figsize_combo.blockSignals(False)
+            _, w, h, fs = FIGURE_SIZE_PRESETS[fig_idx]
+            plt.rcParams.update({
+                'font.size': max(4, round(settings.font_size * fs)),
+                'axes.labelsize': max(4, round(settings.label_size * fs)),
+                'axes.titlesize': max(4, round(settings.title_size * fs)),
+                'xtick.labelsize': max(4, round(settings.tick_size * fs)),
+                'ytick.labelsize': max(4, round(settings.tick_size * fs)),
+                'legend.fontsize': max(4, round(settings.legend_size * fs)),
+                'lines.linewidth': max(0.6, 1.8 * fs),
+                'axes.linewidth': max(0.4, 0.8 * fs),
+                'xtick.major.size': max(2, 4 * fs),
+                'ytick.major.size': max(2, 4 * fs),
+            })
+            if w is not None:
+                dpi = self.canvas.fig.dpi
+                self.canvas.setFixedSize(int(w * dpi), int(h * dpi))
+            else:
+                self.canvas.setSizePolicy(
+                    QSizePolicy.Expanding, QSizePolicy.Expanding
+                )
+                self.canvas.setMinimumSize(0, 0)
+                self.canvas.setMaximumSize(16777215, 16777215)
+
+        sq = state.get("square_aspect", False)
+        self.square_action.setChecked(sq)
+        self.canvas.set_square_aspect(sq)
+
+        grid = state.get("grid_state", 0)
+        self._grid_state = grid
+        self.canvas._grid_state = grid
+
+        palette = state.get("palette_name", "Nature")
+        self._palette_name = palette
+        palette_idx = PALETTE_NAMES.index(palette) if palette in PALETTE_NAMES else 0
+        self.palette_combo.blockSignals(True)
+        self.palette_combo.setCurrentIndex(palette_idx)
+        self.palette_combo.blockSignals(False)
+        NatureColors.set_palette(palette)
+
+        markers = state.get("markers_enabled", False)
+        self._markers_enabled = markers
+        self.canvas._markers_enabled = markers
+        self.markers_action.setChecked(markers)
+
+        self._diff_only = state.get("diff_only", False)
+        self.diff_only_action.setChecked(self._diff_only)
+
+        mem_idx = state.get("mem_index")
+        if mem_idx is not None and 0 <= mem_idx < self.file_list.count():
+            item = self.file_list.item(mem_idx)
+            entry = self.file_list._networks.get(item.text())
+            if entry:
+                self._mem_network = entry
+                self.clr_mem_action.setEnabled(True)
+                self.diff_only_action.setEnabled(True)
+                self.find_changes_action.setEnabled(True)
+
+        self._replot()
+        n = self.file_list.count()
+        self._update_status(
+            f"Session loaded: {n} file(s) from {os.path.basename(path)}"
         )
 
     def _update_selection_status(self, networks):
