@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<!--
+  SNP Viewer - Browser Edition
+  Touchstone / SNP file viewer that runs entirely in the browser.
+
+  "THE BEER-WARE LICENSE" (Revision 42):
+  The author(s) of this file wrote it. As long as you retain this notice you
+  can do whatever you want with this stuff. If we meet some day, and you think
+  this stuff is worth it, you can buy me a beer in return.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SNP Viewer</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" charset="utf-8"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      font-size: 13px;
+      background: #f0f2f5;
+      color: #2c3e50;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    #header {
+      background: #2c3e50;
+      color: #ecf0f1;
+      padding: 7px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    #header h1 { font-size: 15px; font-weight: 600; letter-spacing: .3px; }
+    #header .subtitle { font-size: 11px; color: #95a5a6; }
+
+    /* ── Toolbar ─────────────────────────────────────────────── */
+    #toolbar {
+      background: #ecf0f1;
+      border-bottom: 1px solid #bdc3c7;
+      padding: 5px 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+    .tb-label { font-size: 11px; color: #7f8c8d; white-space: nowrap; }
+    .tb-sep { width: 1px; height: 22px; background: #bdc3c7; margin: 0 4px; flex-shrink: 0; }
+
+    /* ── Button styles ───────────────────────────────────────── */
+    .btn {
+      padding: 3px 9px;
+      border: 1px solid #bdc3c7;
+      background: #fff;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #2c3e50;
+      white-space: nowrap;
+      transition: background .12s, border-color .12s;
+    }
+    .btn:hover { background: #f8f9fa; border-color: #95a5a6; }
+    .btn.active { background: #2c3e50; color: #fff; border-color: #2c3e50; }
+    .btn.primary { background: #2980b9; color: #fff; border-color: #2471a3; }
+    .btn.primary:hover { background: #2471a3; }
+    .btn.danger-active { background: #c0392b; color: #fff; border-color: #a93226; }
+    .btn-group { display: flex; gap: 1px; }
+    .btn-group .btn { border-radius: 0; }
+    .btn-group .btn:first-child { border-radius: 3px 0 0 3px; }
+    .btn-group .btn:last-child  { border-radius: 0 3px 3px 0; }
+
+    /* ── Main layout ─────────────────────────────────────────── */
+    #layout {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    #sidebar {
+      width: 210px;
+      min-width: 210px;
+      background: #fff;
+      border-right: 1px solid #dde1e7;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .sb-section {
+      padding: 8px;
+      border-bottom: 1px solid #eef0f3;
+    }
+    .sb-section:last-child { border-bottom: none; }
+    .sb-title {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      color: #7f8c8d;
+      margin-bottom: 6px;
+    }
+
+    /* File list */
+    #file-list {
+      list-style: none;
+      max-height: 160px;
+      overflow-y: auto;
+      margin-bottom: 5px;
+    }
+    #file-list li {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 4px;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    #file-list li:hover { background: #f0f7ff; }
+    #file-list li.sel { background: #dbeafe; }
+    .f-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .f-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+    }
+    .f-ports { font-size: 10px; color: #95a5a6; flex-shrink: 0; }
+
+    /* Parameter checkboxes */
+    #param-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    #param-list label {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 3px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    #param-list label:hover { background: #f5f5f5; }
+    #param-list input[type=checkbox] { cursor: pointer; }
+
+    /* Small select / number inputs */
+    select, input[type=number] {
+      border: 1px solid #bdc3c7;
+      border-radius: 3px;
+      padding: 2px 5px;
+      font-size: 12px;
+      background: #fff;
+      color: #2c3e50;
+    }
+
+    /* Plot area */
+    #plot-wrap {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: #fff;
+    }
+    #chart { flex: 1; min-height: 0; }
+
+    /* Status bar */
+    #statusbar {
+      background: #ecf0f1;
+      border-top: 1px solid #bdc3c7;
+      padding: 3px 10px;
+      font-size: 11px;
+      color: #7f8c8d;
+      flex-shrink: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Drop overlay */
+    #drop-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(41, 128, 185, .18);
+      border: 3px dashed #2980b9;
+      z-index: 999;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      font-weight: 600;
+      color: #2980b9;
+      pointer-events: none;
+    }
+    #drop-overlay.show { display: flex; }
+
+    /* Flex row helper */
+    .row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #bdc3c7; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<div id="drop-overlay">Drop SNP files here</div>
+
+<!-- ── Header ──────────────────────────────────────────────── -->
+<div id="header">
+  <h1>SNP Viewer</h1>
+  <span class="subtitle">Touchstone File Viewer &mdash; Browser Edition</span>
+</div>
+
+<!-- ── Toolbar ─────────────────────────────────────────────── -->
+<div id="toolbar">
+
+  <span class="tb-label">Plot:</span>
+  <div class="btn-group" id="plot-btns">
+    <button class="btn active" data-plot="magnitude">Magnitude</button>
+    <button class="btn" data-plot="phase">Phase</button>
+    <button class="btn" data-plot="smith">Smith</button>
+    <button class="btn" data-plot="vswr">VSWR</button>
+    <button class="btn" data-plot="gdelay">Group Delay</button>
+  </div>
+
+  <div class="tb-sep"></div>
+
+  <span class="tb-label">Type:</span>
+  <div class="btn-group" id="type-btns">
+    <button class="btn active" data-ptype="S">S</button>
+    <button class="btn" data-ptype="Z">Z</button>
+    <button class="btn" data-ptype="Y">Y</button>
+  </div>
+
+  <div class="tb-sep"></div>
+
+  <span class="tb-label">Format:</span>
+  <select id="fmt-sel">
+    <option value="DB" selected>dB / &deg;</option>
+    <option value="MA">Mag / &deg;</option>
+    <option value="RI">Re / Im</option>
+  </select>
+
+  <div class="tb-sep"></div>
+
+  <span class="tb-label">Memory:</span>
+  <button class="btn" id="btn-mem-store" title="Store current traces as reference">Store</button>
+  <button class="btn" id="btn-mem-diff"  title="Toggle differential from stored reference">Differential</button>
+  <button class="btn" id="btn-mem-clear" title="Clear stored reference">Clear</button>
+
+  <div class="tb-sep"></div>
+
+  <button class="btn" id="btn-export-svg">Export SVG</button>
+  <button class="btn" id="btn-export-snp">Export SNP&hellip;</button>
+
+</div>
+
+<!-- ── Main layout ─────────────────────────────────────────── -->
+<div id="layout">
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+
+    <!-- Files -->
+    <div class="sb-section">
+      <div class="sb-title">Files</div>
+      <ul id="file-list"></ul>
+      <div class="row">
+        <button class="btn primary" id="btn-add">Add File</button>
+        <button class="btn" id="btn-remove">Remove</button>
+      </div>
+      <input type="file" id="file-input"
+        accept=".s1p,.s2p,.s3p,.s4p,.s5p,.s6p,.s7p,.s8p,.s9p,.s10p,.s11p,.s12p,.snp"
+        multiple style="display:none">
+    </div>
+
+    <!-- Parameters -->
+    <div class="sb-section" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+      <div class="sb-title">Parameters</div>
+      <div id="param-list"></div>
+      <div class="row" style="margin-top:6px;">
+        <button class="btn" id="btn-all" style="font-size:11px;padding:2px 6px;">All</button>
+        <button class="btn" id="btn-none" style="font-size:11px;padding:2px 6px;">None</button>
+        <button class="btn" id="btn-diag" style="font-size:11px;padding:2px 6px;">Diag</button>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="sb-section">
+      <div class="sb-title">Reference impedance</div>
+      <div class="row">
+        <input type="number" id="z0-in" value="50" min="0.1" max="10000" step="1"
+          style="width:65px;">
+        <span style="color:#7f8c8d;">&#937;</span>
+      </div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- Plot area -->
+  <div id="plot-wrap">
+    <div id="chart"></div>
+  </div>
+
+</div><!-- /layout -->
+
+<!-- Status bar -->
+<div id="statusbar">Drop SNP files here, or click &ldquo;Add File&rdquo;.</div>
+
+<script>
+'use strict';
+
+/* =========================================================
+   Nature-inspired colour palette (mirrors the desktop app)
+   ========================================================= */
+const COLORS = [
+  '#E64B35','#4DBBD5','#00A087','#3C5488',
+  '#F39B7F','#8491B4','#91D1C2','#DC0000',
+  '#7E6148','#B09C85'
+];
+const DASHES = ['solid','dash','dot','dashdot','longdash','longdashdot'];
+
+/* =========================================================
+   Complex number
+   ========================================================= */
+class C {
+  constructor(re, im = 0) { this.re = re; this.im = im; }
+  static polar(mag, rad) { return new C(mag*Math.cos(rad), mag*Math.sin(rad)); }
+  add(b) { return new C(this.re+b.re, this.im+b.im); }
+  sub(b) { return new C(this.re-b.re, this.im-b.im); }
+  mul(b) { return new C(this.re*b.re - this.im*b.im, this.re*b.im + this.im*b.re); }
+  div(b) {
+    const d = b.re*b.re + b.im*b.im;
+    return new C((this.re*b.re+this.im*b.im)/d, (this.im*b.re-this.re*b.im)/d);
+  }
+  scale(k) { return new C(this.re*k, this.im*k); }
+  abs()    { return Math.sqrt(this.re*this.re + this.im*this.im); }
+  angle()  { return Math.atan2(this.im, this.re); }
+}
+
+/* =========================================================
+   NxN complex matrix helpers
+   ========================================================= */
+function mzero(n) {
+  return Array.from({length:n}, ()=>Array.from({length:n}, ()=>new C(0)));
+}
+function meye(n) {
+  const m = mzero(n);
+  for (let i=0;i<n;i++) m[i][i]=new C(1);
+  return m;
+}
+function madd(A,B) {
+  const n=A.length, R=mzero(n);
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++) R[i][j]=A[i][j].add(B[i][j]);
+  return R;
+}
+function msub(A,B) {
+  const n=A.length, R=mzero(n);
+  for(let i=0;i<n;i++) for(let j=0;j<n;j++) R[i][j]=A[i][j].sub(B[i][j]);
+  return R;
+}
+function mmul(A,B) {
+  const n=A.length, R=mzero(n);
+  for(let i=0;i<n;i++) for(let k=0;k<n;k++) for(let j=0;j<n;j++)
+    R[i][j]=R[i][j].add(A[i][k].mul(B[k][j]));
+  return R;
+}
+function mscale(A,k) {
+  return A.map(r=>r.map(c=>c.scale(k)));
+}
+
+/* Gaussian elimination — returns inverse of A */
+function minv(A) {
+  const n=A.length;
+  const aug = A.map((row,i)=>[
+    ...row.map(c=>new C(c.re,c.im)),
+    ...Array.from({length:n},(_,j)=>new C(i===j?1:0))
+  ]);
+  for(let col=0;col<n;col++){
+    let pRow=col, pAbs=aug[col][col].abs();
+    for(let r=col+1;r<n;r++){
+      const a=aug[r][col].abs();
+      if(a>pAbs){pAbs=a;pRow=r;}
+    }
+    if(pRow!==col)[aug[col],aug[pRow]]=[aug[pRow],aug[col]];
+    const piv=aug[col][col];
+    if(piv.abs()<1e-30) throw new Error('Singular matrix');
+    for(let j=0;j<2*n;j++) aug[col][j]=aug[col][j].div(piv);
+    for(let r=0;r<n;r++){
+      if(r===col) continue;
+      const f=aug[r][col];
+      for(let j=0;j<2*n;j++) aug[r][j]=aug[r][j].sub(f.mul(aug[col][j]));
+    }
+  }
+  return aug.map(row=>row.slice(n));
+}
+
+/* =========================================================
+   Touchstone parser
+   ========================================================= */
+class Touchstone {
+  static parse(text, filename) {
+    let nPorts = null;
+    const extM = filename.match(/\.s(\d+)p$/i);
+    if (extM) nPorts = parseInt(extM[1], 10);
+
+    let freqUnit='GHZ', paramType='S', fmt='MA', z0=50;
+
+    const tokens = [];
+    for (let raw of text.split('\n')) {
+      raw = raw.trim();
+      if (!raw) continue;
+      if (raw.startsWith('[')) continue;
+      if (raw.startsWith('!')) continue;
+      if (raw.startsWith('#')) {
+        const parts = raw.slice(1).trim().toUpperCase().split(/\s+/);
+        for (let i=0;i<parts.length;i++) {
+          const p=parts[i];
+          if (['HZ','KHZ','MHZ','GHZ','THZ'].includes(p)) freqUnit=p;
+          else if (['S','Y','Z','H','G'].includes(p))      paramType=p;
+          else if (['MA','DB','RI'].includes(p))           fmt=p;
+          else if (p==='R' && i+1<parts.length) { z0=parseFloat(parts[++i]); }
+        }
+        continue;
+      }
+      const ci=raw.indexOf('!');
+      const chunk=(ci>=0?raw.slice(0,ci):raw).trim();
+      if (!chunk) continue;
+      for (const tok of chunk.split(/\s+/))
+        if (tok) { const v=parseFloat(tok); if(!isNaN(v)) tokens.push(v); }
+    }
+
+    if (nPorts===null) {
+      for (let n=1;n<=16;n++) {
+        if (tokens.length % (1+2*n*n)===0) { nPorts=n; break; }
+      }
+      if (nPorts===null) nPorts=2;
+    }
+
+    const FMULT = {'HZ':1,'KHZ':1e3,'MHZ':1e6,'GHZ':1e9,'THZ':1e12}[freqUnit]??1e9;
+    const n=nPorts, stride=1+2*n*n, nFreq=Math.floor(tokens.length/stride);
+
+    const freqHz = new Float64Array(nFreq);
+    const rawData = [];
+
+    for (let fi=0;fi<nFreq;fi++) {
+      const off=fi*stride;
+      freqHz[fi]=tokens[off]*FMULT;
+      const mat=Array.from({length:n},()=>Array(n).fill(null));
+      if (n===2) {
+        let k=0;
+        for(let c=0;c<n;c++) for(let r=0;r<n;r++){
+          const idx=off+1+k*2;
+          mat[r][c]=Touchstone._toC(tokens[idx],tokens[idx+1],fmt);
+          k++;
+        }
+      } else {
+        let k=0;
+        for(let r=0;r<n;r++) for(let c=0;c<n;c++){
+          const idx=off+1+k*2;
+          mat[r][c]=Touchstone._toC(tokens[idx],tokens[idx+1],fmt);
+          k++;
+        }
+      }
+      rawData.push(mat);
+    }
+
+    const sData = paramType==='S'
+      ? rawData
+      : Touchstone._toS(rawData, paramType, z0);
+
+    return { filename, nPorts, z0, freqHz, sData };
+  }
+
+  static _toC(v1,v2,fmt) {
+    switch(fmt) {
+      case 'RI': return new C(v1,v2);
+      case 'MA': return C.polar(v1, v2*Math.PI/180);
+      case 'DB': return C.polar(Math.pow(10,v1/20), v2*Math.PI/180);
+      default:   return new C(v1,v2);
+    }
+  }
+
+  static _toS(mats, type, z0) {
+    return mats.map(M => {
+      const n=M.length, I=meye(n);
+      let Z;
+      if (type==='Z') {
+        Z=M;
+      } else if (type==='Y') {
+        try { Z=minv(M); } catch{ Z=mscale(meye(n),z0); }
+      } else {
+        return M;
+      }
+      const Z0I=mscale(I,z0);
+      try {
+        return mmul(msub(Z,Z0I), minv(madd(Z,Z0I)));
+      } catch {
+        return mzero(n);
+      }
+    });
+  }
+
+  static write(net, targetType, outFmt, z0out) {
+    const {nPorts:n, freqHz, sData} = net;
+    const sc = autoScale(freqHz);
+    let lines = [
+      `! SNP Viewer export`,
+      `# ${sc.unit.toUpperCase()} ${targetType} ${outFmt} R ${z0out}`
+    ];
+    const mats = getParamMats(net, targetType, z0out);
+    for (let fi=0;fi<freqHz.length;fi++) {
+      const row=[];
+      row.push((freqHz[fi]*sc.mult).toPrecision(10));
+      const mat=mats[fi];
+      const pairs=[];
+      if (n===2){
+        for(let c=0;c<n;c++) for(let r=0;r<n;r++) pairs.push(mat[r][c]);
+      } else {
+        for(let r=0;r<n;r++) for(let c=0;c<n;c++) pairs.push(mat[r][c]);
+      }
+      for(const cv of pairs){
+        switch(outFmt){
+          case 'RI': row.push(cv.re.toPrecision(8), cv.im.toPrecision(8)); break;
+          case 'MA': {
+            const mag=cv.abs(), ang=cv.angle()*180/Math.PI;
+            row.push(mag.toPrecision(8), ang.toPrecision(8)); break;
+          }
+          case 'DB': {
+            const db=20*Math.log10(Math.max(cv.abs(),1e-30));
+            const ang=cv.angle()*180/Math.PI;
+            row.push(db.toPrecision(8), ang.toPrecision(8)); break;
+          }
+        }
+      }
+      lines.push(row.join('  '));
+    }
+    return lines.join('\n');
+  }
+}
+
+/* =========================================================
+   Frequency auto-scaling
+   ========================================================= */
+function autoScale(freqArr) {
+  const mx = Math.max(...freqArr);
+  if (mx>=1e12) return {mult:1e-12,unit:'THz'};
+  if (mx>=1e9)  return {mult:1e-9, unit:'GHz'};
+  if (mx>=1e6)  return {mult:1e-6, unit:'MHz'};
+  if (mx>=1e3)  return {mult:1e-3, unit:'kHz'};
+  return {mult:1,unit:'Hz'};
+}
+
+/* =========================================================
+   Parameter conversion (S -> Z or Y per frequency)
+   ========================================================= */
+function getParamMats(net, targetType, z0) {
+  const {sData, nPorts:n} = net;
+  if (targetType==='S') return sData;
+  return sData.map(S => {
+    const I=meye(n);
+    try {
+      if (targetType==='Z') {
+        return mscale(mmul(madd(I,S), minv(msub(I,S))), z0);
+      } else {
+        return mscale(mmul(msub(I,S), minv(madd(I,S))), 1/z0);
+      }
+    } catch { return mzero(n); }
+  });
+}
+
+/* Phase unwrap */
+function unwrap(phases) {
+  const r=[...phases];
+  for(let i=1;i<r.length;i++){
+    let d=r[i]-r[i-1];
+    while(d> Math.PI) d-=2*Math.PI;
+    while(d<-Math.PI) d+=2*Math.PI;
+    r[i]=r[i-1]+d;
+  }
+  return r;
+}
+
+/* =========================================================
+   Smith-chart background traces
+   ========================================================= */
+function smithBg() {
+  const traces=[], NP=400;
+  const base={mode:'lines',type:'scatter',showlegend:false,
+               hoverinfo:'skip',name:'',line:{width:.7}};
+
+  function arc(cx,cy,r,col){
+    const xs=[],ys=[];
+    for(let i=0;i<=NP;i++){
+      const t=2*Math.PI*i/NP;
+      const x=cx+r*Math.cos(t), y=cy+r*Math.sin(t);
+      if(x*x+y*y<=1.002){xs.push(x);ys.push(y);}
+      else if(xs.length){xs.push(null);ys.push(null);}
+    }
+    return {...base,x:xs,y:ys,line:{...base.line,color:col}};
+  }
+
+  const tt=Array.from({length:NP+1},(_,i)=>2*Math.PI*i/NP);
+  traces.push({...base,x:tt.map(t=>Math.cos(t)),y:tt.map(t=>Math.sin(t)),
+                line:{width:1.5,color:'#333'}});
+
+  for(const r of [0,.2,.5,1,2,5]){
+    const cx=r/(r+1), ra=1/(r+1);
+    traces.push(arc(cx,0,ra, r===1?'#777':'#c8c8c8'));
+  }
+
+  for(const xs of [.2,.5,1,2,5]){
+    for(const sg of [1,-1]){
+      const x=sg*xs, cy=1/x, ra=1/Math.abs(x);
+      traces.push(arc(1,cy,ra,'#c8c8c8'));
+    }
+  }
+
+  traces.push({...base,x:[-1,1],y:[0,0],line:{width:.7,color:'#aaa'}});
+
+  traces.push({
+    type:'scatter',mode:'text',showlegend:false,hoverinfo:'skip',name:'',
+    x:[0, .333, .5, .667, .75, .833, -1],
+    y:[0,   0,    0,   0,   0,   0,    0],
+    text:['0','0.5','1','2','5','10','∞'],
+    textposition:'bottom center',
+    textfont:{size:9,color:'#888'}
+  });
+
+  return traces;
+}
+
+/* =========================================================
+   App state
+   ========================================================= */
+const state = {
+  files: [],
+  selIdx: -1,
+  checkedParams: new Set(),
+  plotType: 'magnitude',
+  paramType: 'S',
+  fmt: 'DB',
+  z0: 50,
+  memory: null,
+  showDiff: false,
+};
+
+/* =========================================================
+   Rendering
+   ========================================================= */
+const chartEl = document.getElementById('chart');
+
+function render() {
+  if (!state.files.length || !state.checkedParams.size) {
+    Plotly.react(chartEl,[],{
+      title:{text:'Load SNP files and select parameters',font:{size:14,color:'#aaa'}},
+      paper_bgcolor:'#fff',plot_bgcolor:'#fafafa',
+      xaxis:{visible:false},yaxis:{visible:false}
+    },{responsive:true});
+    return;
+  }
+  if (state.plotType==='smith') renderSmith();
+  else renderCartesian();
+}
+
+function traceStyle(fileIdx, pairIdx) {
+  const total = state.checkedParams.size||1;
+  const ci = (fileIdx*total+pairIdx) % COLORS.length;
+  return { color:COLORS[ci], dash:DASHES[fileIdx%DASHES.length] };
+}
+
+function renderCartesian() {
+  const traces=[];
+  const params=sortedParams();
+  const pt=state.plotType, fmt=state.fmt, z0=state.z0;
+
+  const allFreqs=state.files.flatMap(f=>Array.from(f.freqHz));
+  const sc=autoScale(allFreqs);
+
+  state.files.forEach((net,fi)=>{
+    const mats=getParamMats(net, state.paramType, z0);
+    const fx=Array.from(net.freqHz).map(f=>f*sc.mult);
+
+    params.forEach(([r,c],pi)=>{
+      if(r>=net.nPorts||c>=net.nPorts) return;
+
+      const cvs=mats.map(m=>m[r][c]);
+      let yVals=toY(cvs, pt, fmt, net.freqHz);
+
+      if(state.showDiff && state.memory && state.memory[fi]){
+        const mnet=state.memory[fi];
+        const mmats=getParamMats(mnet, state.paramType, z0);
+        const mcvs=mmats.map(m=>m[r][c]);
+        const myRef=toY(mcvs, pt, fmt, mnet.freqHz);
+        yVals=yVals.map((v,i)=>{
+          const mf=net.freqHz[i];
+          const ref=interp1(mnet.freqHz, myRef, mf);
+          return ref===null ? v : v-ref;
+        });
+      }
+
+      const lbl=`${state.paramType}${r+1},${c+1} [${net.filename}]`
+               +(state.showDiff&&state.memory?' Δ':'');
+      const st=traceStyle(fi,pi);
+
+      if(pt==='magnitude' && fmt==='RI'){
+        const re=cvs.map(cv=>cv.re), im=cvs.map(cv=>cv.im);
+        traces.push({x:fx,y:re,mode:'lines',name:`Re(${lbl})`,
+          line:{color:st.color,dash:st.dash,width:1.5},
+          hovertemplate:`%{x:.4g} ${sc.unit}<br>Re=%{y:.5g}<extra></extra>`});
+        traces.push({x:fx,y:im,mode:'lines',name:`Im(${lbl})`,
+          line:{color:st.color,dash:'dot',width:1.5},
+          hovertemplate:`%{x:.4g} ${sc.unit}<br>Im=%{y:.5g}<extra></extra>`});
+      } else {
+        traces.push({
+          x:fx, y:yVals, mode:'lines', name:lbl,
+          line:{color:st.color,dash:st.dash,width:1.8},
+          hovertemplate:`%{x:.4g} ${sc.unit}<br>${yLabel(pt,fmt,state.paramType)}=%{y:.4g}<extra></extra>`
+        });
+      }
+    });
+  });
+
+  Plotly.react(chartEl, traces, cartLayout(sc, pt, fmt), {responsive:true});
+}
+
+function toY(cvs, pt, fmt, freqHz) {
+  switch(pt){
+    case 'magnitude':
+      if(fmt==='DB') return cvs.map(c=>20*Math.log10(Math.max(c.abs(),1e-30)));
+      return cvs.map(c=>c.abs());
+    case 'phase':
+      return cvs.map(c=>c.angle()*180/Math.PI);
+    case 'vswr':
+      return cvs.map(c=>{ const m=c.abs(); return m>=1?100:Math.min((1+m)/(1-m),100); });
+    case 'gdelay':{
+      const ph=unwrap(cvs.map(c=>c.angle()));
+      const om=Array.from(freqHz).map(f=>2*Math.PI*f);
+      return ph.map((_,i)=>{
+        if(!i||i===ph.length-1) return 0;
+        const dp=ph[i+1]-ph[i-1], dw=om[i+1]-om[i-1];
+        return dw ? -dp/dw*1e9 : 0;
+      });
+    }
+    default: return cvs.map(c=>c.abs());
+  }
+}
+
+function yLabel(pt,fmt,ptype) {
+  if(pt==='magnitude'){
+    if(fmt==='DB') return ptype==='Z'?'dBΩ':ptype==='Y'?'dBS':'dB';
+    return ptype==='Z'?'Ω':ptype==='Y'?'S':'|·|';
+  }
+  if(pt==='phase')  return 'deg';
+  if(pt==='vswr')   return 'VSWR';
+  if(pt==='gdelay') return 'ns';
+  return '';
+}
+
+function cartLayout(sc, pt, fmt) {
+  const titles={
+    magnitude:`${state.paramType}-Parameters — Magnitude`,
+    phase:`${state.paramType}-Parameters — Phase`,
+    vswr:'VSWR',
+    gdelay:'Group Delay'
+  };
+  return {
+    title:{text:titles[pt]??'',font:{size:13}},
+    xaxis:{title:{text:`Frequency (${sc.unit})`},showgrid:true,gridcolor:'#eee',zeroline:false},
+    yaxis:{title:{text:yLabel(pt,fmt,state.paramType)},showgrid:true,gridcolor:'#eee',zeroline:pt!=='magnitude'},
+    paper_bgcolor:'#fff',plot_bgcolor:'#fafafa',
+    legend:{orientation:'h',y:-0.18,font:{size:11}},
+    margin:{t:40,r:20,b:90,l:65},
+    hovermode:'closest'
+  };
+}
+
+function renderSmith() {
+  const bg=smithBg();
+  const data=[];
+  const params=sortedParams();
+
+  state.files.forEach((net,fi)=>{
+    const mats=getParamMats(net,'S',state.z0);
+    const sc=autoScale(Array.from(net.freqHz));
+
+    params.forEach(([r,c],pi)=>{
+      if(r>=net.nPorts||c>=net.nPorts) return;
+      const cvs=mats.map(m=>m[r][c]);
+      const st=traceStyle(fi,pi);
+      const htxt=cvs.map((cv,i)=>{
+        const f=(net.freqHz[i]*sc.mult).toPrecision(5);
+        return `${f} ${sc.unit}<br>|Γ|=${cv.abs().toFixed(4)} ∠${(cv.angle()*180/Math.PI).toFixed(1)}°`;
+      });
+      data.push({
+        x:cvs.map(cv=>cv.re), y:cvs.map(cv=>cv.im),
+        mode:'lines+markers',
+        name:`S${r+1},${c+1} [${net.filename}]`,
+        line:{color:st.color,dash:st.dash,width:2},
+        marker:{size:3,color:st.color},
+        text:htxt, hovertemplate:'%{text}<extra></extra>'
+      });
+    });
+  });
+
+  Plotly.react(chartEl,[...bg,...data],{
+    title:{text:'Smith Chart',font:{size:13}},
+    xaxis:{range:[-1.15,1.15],showgrid:false,zeroline:false,showticklabels:false,scaleanchor:'y'},
+    yaxis:{range:[-1.15,1.15],showgrid:false,zeroline:false,showticklabels:false},
+    paper_bgcolor:'#fff',plot_bgcolor:'#fff',
+    legend:{orientation:'h',y:-0.08,font:{size:11}},
+    margin:{t:40,r:20,b:60,l:20},
+    hovermode:'closest'
+  },{responsive:true});
+}
+
+function interp1(freqs, vals, f) {
+  if(!freqs.length) return null;
+  if(f<freqs[0]||f>freqs[freqs.length-1]) return null;
+  let lo=0, hi=freqs.length-1;
+  while(hi-lo>1){ const m=(lo+hi)>>1; if(freqs[m]<=f)lo=m;else hi=m; }
+  const t=(f-freqs[lo])/(freqs[hi]-freqs[lo]);
+  return vals[lo]*(1-t)+vals[hi]*t;
+}
+
+function sortedParams() {
+  return [...state.checkedParams]
+    .map(k=>k.split(',').map(Number))
+    .sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+}
+
+function updateStatus() {
+  const el=document.getElementById('statusbar');
+  if(!state.files.length){
+    el.textContent='Drop SNP files here, or click "Add File".';
+    return;
+  }
+  const allF=state.files.flatMap(f=>Array.from(f.freqHz));
+  const sc=autoScale(allF);
+  const fmin=(Math.min(...allF)*sc.mult).toFixed(3);
+  const fmax=(Math.max(...allF)*sc.mult).toFixed(3);
+  const pts=Math.max(...state.files.map(f=>f.freqHz.length));
+  let s=`${state.files.length} file${state.files.length>1?'s':''} · ${pts} pts · ${fmin}–${fmax} ${sc.unit}`;
+  if(state.memory) s+=' · Memory stored';
+  if(state.showDiff) s+=' · Differential ON';
+  el.textContent=s;
+}
+
+function rebuildFileList() {
+  const ul=document.getElementById('file-list');
+  ul.innerHTML='';
+  state.files.forEach((net,i)=>{
+    const li=document.createElement('li');
+    li.className=i===state.selIdx?'sel':'';
+    li.innerHTML=`<div class="f-dot" style="background:${COLORS[i%COLORS.length]}"></div>
+      <span class="f-name" title="${net.filename}">${net.filename}</span>
+      <span class="f-ports">${net.nPorts}p</span>`;
+    li.onclick=()=>{ state.selIdx=i; rebuildFileList(); };
+    ul.appendChild(li);
+  });
+}
+
+function rebuildParamList() {
+  const div=document.getElementById('param-list');
+  div.innerHTML='';
+  if(!state.files.length) return;
+  const n=Math.max(...state.files.map(f=>f.nPorts));
+  for(let r=0;r<n;r++) for(let c=0;c<n;c++){
+    const key=`${r},${c}`;
+    const lbl=document.createElement('label');
+    const cb=document.createElement('input');
+    cb.type='checkbox'; cb.checked=state.checkedParams.has(key);
+    cb.onchange=()=>{
+      cb.checked ? state.checkedParams.add(key) : state.checkedParams.delete(key);
+      render();
+    };
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(` ${state.paramType}${r+1},${c+1}`));
+    div.appendChild(lbl);
+  }
+}
+
+async function loadFiles(fileList) {
+  for(const f of fileList){
+    try{
+      const text=await f.text();
+      const net=Touchstone.parse(text,f.name);
+      state.files.push(net);
+      if(state.files.length===1){
+        state.checkedParams.clear();
+        for(let i=0;i<net.nPorts;i++) state.checkedParams.add(`${i},${i}`);
+        if(net.nPorts>=2) state.checkedParams.add('1,0');
+      }
+    }catch(e){
+      alert(`Error loading ${f.name}:\n${e.message}`);
+    }
+  }
+  rebuildFileList();
+  rebuildParamList();
+  updateStatus();
+  render();
+}
+
+/* =========================================================
+   Event wiring
+   ========================================================= */
+
+document.querySelectorAll('#plot-btns .btn').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('#plot-btns .btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    state.plotType=btn.dataset.plot;
+    render();
+  };
+});
+
+document.querySelectorAll('#type-btns .btn').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('#type-btns .btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    state.paramType=btn.dataset.ptype;
+    rebuildParamList();
+    render();
+  };
+});
+
+document.getElementById('fmt-sel').onchange=e=>{
+  state.fmt=e.target.value; render();
+};
+
+document.getElementById('z0-in').onchange=e=>{
+  const v=parseFloat(e.target.value);
+  if(v>0){ state.z0=v; render(); }
+};
+
+document.getElementById('btn-add').onclick=()=>document.getElementById('file-input').click();
+document.getElementById('file-input').onchange=e=>{
+  if(e.target.files.length) loadFiles(Array.from(e.target.files));
+  e.target.value='';
+};
+document.getElementById('btn-remove').onclick=()=>{
+  if(state.selIdx<0||state.selIdx>=state.files.length) return;
+  state.files.splice(state.selIdx,1);
+  state.selIdx=Math.min(state.selIdx, state.files.length-1);
+  if(!state.files.length){ state.selIdx=-1; state.checkedParams.clear(); }
+  rebuildFileList(); rebuildParamList(); updateStatus(); render();
+};
+
+document.getElementById('btn-all').onclick=()=>{
+  if(!state.files.length) return;
+  const n=Math.max(...state.files.map(f=>f.nPorts));
+  state.checkedParams.clear();
+  for(let r=0;r<n;r++) for(let c=0;c<n;c++) state.checkedParams.add(`${r},${c}`);
+  rebuildParamList(); render();
+};
+document.getElementById('btn-none').onclick=()=>{
+  state.checkedParams.clear(); rebuildParamList(); render();
+};
+document.getElementById('btn-diag').onclick=()=>{
+  if(!state.files.length) return;
+  const n=Math.max(...state.files.map(f=>f.nPorts));
+  state.checkedParams.clear();
+  for(let i=0;i<n;i++) state.checkedParams.add(`${i},${i}`);
+  rebuildParamList(); render();
+};
+
+document.getElementById('btn-mem-store').onclick=()=>{
+  state.memory=state.files.map(f=>({...f}));
+  state.showDiff=false;
+  document.getElementById('btn-mem-diff').classList.remove('danger-active');
+  updateStatus();
+};
+document.getElementById('btn-mem-diff').onclick=()=>{
+  if(!state.memory){ alert('No memory stored. Click "Store" first.'); return; }
+  state.showDiff=!state.showDiff;
+  document.getElementById('btn-mem-diff').classList.toggle('danger-active',state.showDiff);
+  updateStatus(); render();
+};
+document.getElementById('btn-mem-clear').onclick=()=>{
+  state.memory=null; state.showDiff=false;
+  document.getElementById('btn-mem-diff').classList.remove('danger-active');
+  updateStatus(); render();
+};
+
+document.getElementById('btn-export-svg').onclick=()=>{
+  Plotly.downloadImage(chartEl,{format:'svg',filename:'snpviewer'});
+};
+
+document.getElementById('btn-export-snp').onclick=()=>{
+  if(!state.files.length){ alert('No files loaded.'); return; }
+  const net=state.selIdx>=0 ? state.files[state.selIdx] : state.files[0];
+  const text=Touchstone.write(net,state.paramType,state.fmt,state.z0);
+  const blob=new Blob([text],{type:'text/plain'});
+  const base=net.filename.replace(/\.[^.]+$/,'')||'export';
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=base+'_exported.s'+net.nPorts+'p';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+const overlay=document.getElementById('drop-overlay');
+let dragCnt=0;
+document.addEventListener('dragenter',e=>{
+  if([...e.dataTransfer.types].includes('Files')){ dragCnt++; overlay.classList.add('show'); }
+});
+document.addEventListener('dragleave',()=>{ if(--dragCnt<=0){dragCnt=0;overlay.classList.remove('show');} });
+document.addEventListener('dragover',e=>e.preventDefault());
+document.addEventListener('drop',e=>{
+  e.preventDefault(); dragCnt=0; overlay.classList.remove('show');
+  const files=[...e.dataTransfer.files].filter(f=>/\.(s\d+p|snp)$/i.test(f.name));
+  if(files.length) loadFiles(files);
+});
+
+render();
+</script>
+</body>
+</html>
