@@ -116,6 +116,10 @@ class AppSettings:
         self.tick_size: int = 9     # tick labels
         self.legend_size: int = 9   # legend text
 
+        # Custom palettes and default palette
+        self.custom_palettes: dict = {}
+        self.default_palette: str = 'Nature'
+
         self._path = self._find_conf_file()
         if self._path:
             self._load(self._path)
@@ -155,6 +159,7 @@ class AppSettings:
 
     def _load(self, path):
         raw = {}
+        raw_orig = {}
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
@@ -163,12 +168,14 @@ class AppSettings:
                 if '=' not in line:
                     continue
                 key, _, value = line.partition('=')
-                key = key.strip().lower()
+                orig_key = key.strip()
+                key = orig_key.lower()
                 value = value.strip()
-                # Strip inline comments
-                if '#' in value:
+                # Strip inline comments (skip for palette_ keys where # is data)
+                if not key.startswith('palette_') and '#' in value:
                     value = value[:value.index('#')].strip()
                 raw[key] = value
+                raw_orig[orig_key] = value
 
         # param_type
         if 'param_type' in raw:
@@ -216,6 +223,21 @@ class AppSettings:
                         setattr(self, _attr, v)
                 except ValueError:
                     pass
+
+        # Custom palettes: palette_<Name> = #hex, #hex, ...
+        import re
+        for orig_key, _val in raw_orig.items():
+            if orig_key.lower().startswith('palette_'):
+                name = orig_key[8:]
+                if not name:
+                    continue
+                colors = [c.strip() for c in _val.split(',')
+                          if re.match(r'^#[0-9a-fA-F]{6}$', c.strip())]
+                if len(colors) >= 2:
+                    self.custom_palettes[name] = colors
+
+        if 'default_palette' in raw:
+            self.default_palette = raw['default_palette']
 
     @staticmethod
     def _parse_params(value: str, default: list) -> list:
@@ -366,6 +388,9 @@ COLOR_PALETTES = {
     'Grayscale': ['#000000', '#333333', '#555555', '#777777', '#999999',
                   '#AAAAAA', '#BBBBBB', '#CCCCCC', '#DDDDDD', '#EEEEEE'],
 }
+
+for _name, _colors in settings.custom_palettes.items():
+    COLOR_PALETTES[_name] = _colors
 
 PALETTE_NAMES = list(COLOR_PALETTES.keys())
 
@@ -2111,7 +2136,8 @@ class FileListWidget(QListWidget):
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.itemSelectionChanged.connect(self._on_selection_changed)
         self.setAlternatingRowColors(True)
-        self.setDragDropMode(QListWidget.NoDragDrop)
+        self.setDragDropMode(QListWidget.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
         self.setStyleSheet("""
             QListWidget {
                 border: 1px solid #D0D0D0;
@@ -2130,6 +2156,40 @@ class FileListWidget(QListWidget):
                 background-color: #F8F8F8;
             }
         """)
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.selection_updated.emit()
+
+    def _swap_items(self, row_a, row_b):
+        """Swap two list items by index, including their dict-keyed data."""
+        item_a = self.item(row_a)
+        item_b = self.item(row_b)
+        text_a, tip_a = item_a.text(), item_a.toolTip()
+        text_b, tip_b = item_b.text(), item_b.toolTip()
+        sel_a, sel_b = item_a.isSelected(), item_b.isSelected()
+        item_a.setText(text_b)
+        item_a.setToolTip(tip_b)
+        item_b.setText(text_a)
+        item_b.setToolTip(tip_a)
+        item_a.setSelected(sel_b)
+        item_b.setSelected(sel_a)
+
+    def move_selected(self, direction):
+        """Move selected items up (-1) or down (+1), preserving selection."""
+        rows = sorted(self.row(item) for item in self.selectedItems())
+        if not rows:
+            return
+        if direction == -1 and rows[0] == 0:
+            return
+        if direction == 1 and rows[-1] == self.count() - 1:
+            return
+        self.blockSignals(True)
+        order = list(rows) if direction == -1 else list(reversed(rows))
+        for row in order:
+            self._swap_items(row, row + direction)
+        self.blockSignals(False)
+        self.selection_updated.emit()
 
     def add_network(self, filepath):
         """Load and add a Touchstone file. Returns (True, '') on success."""
@@ -2539,7 +2599,7 @@ class SNPViewerApp(QMainWindow):
         self._mem_network = None   # (short_name, Network) or None
         self._diff_only = False    # Show differential traces only
         self._grid_state = 0
-        self._palette_name = 'Nature'
+        self._palette_name = settings.default_palette
         self._markers_enabled = False
 
         NatureColors.apply_matplotlib_defaults()
@@ -2547,6 +2607,13 @@ class SNPViewerApp(QMainWindow):
         self._build_menu()
         self._build_toolbar()
         self._connect_signals()
+
+        # Apply default palette from config
+        if self._palette_name in PALETTE_NAMES:
+            idx = PALETTE_NAMES.index(self._palette_name)
+            self.palette_combo.setCurrentIndex(idx)
+            NatureColors.set_palette(self._palette_name)
+
         self._update_status("Ready. Open or drag-and-drop SNP files to begin.")
 
     def _build_ui(self):
@@ -2604,8 +2671,30 @@ class SNPViewerApp(QMainWindow):
             }
             QPushButton:hover { background-color: #D0D0D0; }
         """)
+        _move_btn_style = """
+            QPushButton {
+                background-color: #E0E0E0;
+                color: #333;
+                border: none;
+                border-radius: 3px;
+                padding: 5px 6px;
+                font-size: 9pt;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #D0D0D0; }
+        """
+        self.btn_move_up = QPushButton("▲")
+        self.btn_move_up.setToolTip("Move selected files up")
+        self.btn_move_up.setStyleSheet(_move_btn_style)
+        self.btn_move_up.setFixedWidth(28)
+        self.btn_move_down = QPushButton("▼")
+        self.btn_move_down.setToolTip("Move selected files down")
+        self.btn_move_down.setStyleSheet(_move_btn_style)
+        self.btn_move_down.setFixedWidth(28)
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_remove)
+        btn_row.addWidget(self.btn_move_up)
+        btn_row.addWidget(self.btn_move_down)
         sidebar_layout.addLayout(btn_row)
 
         # Separator
@@ -2993,6 +3082,8 @@ class SNPViewerApp(QMainWindow):
         self.plot_tab_bar.currentChanged.connect(self._on_tab_changed)
         self.btn_add.clicked.connect(self.open_files)
         self.btn_remove.clicked.connect(self._on_remove)
+        self.btn_move_up.clicked.connect(lambda: self.file_list.move_selected(-1))
+        self.btn_move_down.clicked.connect(lambda: self.file_list.move_selected(1))
         self.conversion_panel.save_btn.clicked.connect(self._on_save)
 
     # --- Slots ---
