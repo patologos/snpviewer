@@ -1,0 +1,71 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <clipPath id="ic">
+    <rect x="0" y="0" width="512" height="512" rx="90"/>
+  </clipPath>
+</defs>
+
+<rect x="0" y="0" width="512" height="512" rx="90" fill="#1E3A5F"/>
+
+<g clip-path="url(#ic)" opacity="0.12" stroke="#7EB8E0" stroke-width="0.8">
+  <line x1="0" y1="85" x2="512" y2="85"/>
+  <line x1="0" y1="170" x2="512" y2="170"/>
+  <line x1="0" y1="256" x2="512" y2="256"/>
+  <line x1="0" y1="341" x2="512" y2="341"/>
+  <line x1="0" y1="427" x2="512" y2="427"/>
+  <line x1="85" y1="0" x2="85" y2="512"/>
+  <line x1="170" y1="0" x2="170" y2="512"/>
+  <line x1="256" y1="0" x2="256" y2="512"/>
+  <line x1="341" y1="0" x2="341" y2="512"/>
+  <line x1="427" y1="0" x2="427" y2="512"/>
+</g>
+
+<g clip-path="url(#ic)">
+  <!-- S21 trace (red) -->
+  <path d="M 20 310
+           C 60 310, 80 308, 110 305
+           Q 140 302, 160 290
+           Q 180 275, 190 230
+           Q 200 170, 205 100
+           Q 208 65, 215 100
+           Q 225 180, 230 245
+           Q 235 275, 250 295
+           Q 270 308, 310 310
+           Q 340 308, 355 295
+           Q 365 280, 372 240
+           Q 378 180, 382 95
+           Q 385 58, 390 95
+           Q 398 185, 405 250
+           Q 410 285, 430 300
+           Q 450 310, 495 310"
+        fill="none" stroke="#E64B35" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- S11 trace (cyan, dashed) -->
+  <path d="M 20 350
+           C 60 350, 90 348, 130 345
+           Q 170 342, 185 338
+           Q 195 335, 200 320
+           Q 205 300, 208 260
+           Q 210 240, 215 260
+           Q 220 300, 225 325
+           Q 235 342, 270 348
+           Q 310 350, 345 348
+           Q 365 345, 372 335
+           Q 378 320, 382 280
+           Q 385 245, 388 260
+           Q 394 290, 400 325
+           Q 410 345, 440 348
+           Q 465 350, 495 350"
+        fill="none" stroke="#4DBBD5" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="14 7"/>
+
+  <!-- Peak dots -->
+  <circle cx="210" cy="65" r="7" fill="#E64B35" opacity="0.9"/>
+  <circle cx="386" cy="58" r="7" fill="#E64B35" opacity="0.9"/>
+
+  <!-- SNP text -->
+  <text x="256" y="435" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="80" font-weight="700" fill="#FFFFFF" letter-spacing="8" opacity="0.95">SNP</text>
+
+  <!-- VIEWER subtitle -->
+  <text x="256" y="465" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" fill="#7EB8E0" letter-spacing="14" opacity="0.8">VIEWER</text>
+</g>
+</svg>
