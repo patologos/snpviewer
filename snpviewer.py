@@ -23,7 +23,7 @@ try:
         QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
         QDialog, QSpinBox, QFormLayout
     )
-    from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize
+    from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize, QSettings
     from PyQt5.QtGui import QIcon, QFont, QColor, QPalette, QCursor
     from matplotlib.backends.backend_qt5agg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
@@ -37,7 +37,7 @@ except ImportError:
         QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
         QDialog, QSpinBox, QFormLayout
     )
-    from PySide6.QtCore import Qt, Signal, QSize
+    from PySide6.QtCore import Qt, Signal, QSize, QSettings
     from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QCursor
     from matplotlib.backends.backend_qtagg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
@@ -2496,15 +2496,21 @@ class ConversionPanel(QGroupBox):
         param = self.param_combo.currentText().lower()
         form = self.format_combo.currentText().lower()
 
+        start_dir = ""
+        main_win = self.window()
+        if hasattr(main_win, '_last_dir'):
+            start_dir = main_win._last_dir()
         filepath, _ = QFileDialog.getSaveFileName(
             self,
             "Save Touchstone File",
-            f"converted{default_ext}",
+            os.path.join(start_dir, f"converted{default_ext}") if start_dir else f"converted{default_ext}",
             f"Touchstone Files (*{default_ext});;All Files (*)"
         )
 
         if not filepath:
             return
+        if hasattr(main_win, '_save_last_dir'):
+            main_win._save_last_dir(filepath)
 
         try:
             z0 = self.z0_spin.value()
@@ -2593,6 +2599,7 @@ class SNPViewerApp(QMainWindow):
         if os.path.isfile(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
+        self._qsettings = QSettings("SNPViewer", "SNPViewer")
         self._param_type = settings.param_type   # 'S', 'Z', or 'Y'
 
         # Math Memory state
@@ -3086,6 +3093,17 @@ class SNPViewerApp(QMainWindow):
         self.btn_move_down.clicked.connect(lambda: self.file_list.move_selected(1))
         self.conversion_panel.save_btn.clicked.connect(self._on_save)
 
+    # --- Directory persistence ---
+
+    def _last_dir(self):
+        d = self._qsettings.value("last_directory", "")
+        return d if d and os.path.isdir(d) else ""
+
+    def _save_last_dir(self, path):
+        d = os.path.dirname(path) if os.path.isfile(path) else path
+        if os.path.isdir(d):
+            self._qsettings.setValue("last_directory", d)
+
     # --- Slots ---
 
     def open_files(self):
@@ -3093,7 +3111,7 @@ class SNPViewerApp(QMainWindow):
         filepaths, _ = QFileDialog.getOpenFileNames(
             self,
             "Open Touchstone Files",
-            "",
+            self._last_dir(),
             "Touchstone Files (*.s1p *.s2p *.s3p *.s4p *.s5p *.s6p "
             "*.s7p *.s8p *.s9p *.s10p *.s11p *.s12p *.snp);;"
             "All Files (*)"
@@ -3101,6 +3119,7 @@ class SNPViewerApp(QMainWindow):
         if not filepaths:
             return
 
+        self._save_last_dir(filepaths[0])
         errors = []
         for fp in filepaths:
             ok, err = self.file_list.add_network(fp)
@@ -3320,13 +3339,14 @@ class SNPViewerApp(QMainWindow):
             return
 
         f_unit = results[0]['f_unit']
-        default_name = "q_factors.csv"
+        default_name = os.path.join(self._last_dir(), "q_factors.csv") if self._last_dir() else "q_factors.csv"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Q Results", default_name,
             "CSV Files (*.csv);;All Files (*)"
         )
         if not path:
             return
+        self._save_last_dir(path)
 
         with open(path, 'w', newline='') as fh:
             writer = csv.writer(fh)
@@ -3565,7 +3585,7 @@ class SNPViewerApp(QMainWindow):
             fmt = format_combo.currentText().lower()
             ext_map = {'png': '.png', 'pdf': '.pdf', 'svg': '.svg', 'eps': '.eps'}
             ext = ext_map.get(fmt, '.png')
-            default_name = f"figure{ext}"
+            default_name = os.path.join(self._last_dir(), f"figure{ext}") if self._last_dir() else f"figure{ext}"
             filter_str = f"{fmt.upper()} Files (*{ext});;All Files (*)"
 
             path, _ = QFileDialog.getSaveFileName(
@@ -3573,6 +3593,7 @@ class SNPViewerApp(QMainWindow):
             )
             if not path:
                 return
+            self._save_last_dir(path)
 
             dpi = dpi_spin.value()
             w = width_spin.value()
@@ -3604,12 +3625,14 @@ class SNPViewerApp(QMainWindow):
 
     def _save_session(self):
         """Save the current application state to a JSON file."""
+        default_name = os.path.join(self._last_dir(), "session.json") if self._last_dir() else "session.json"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "session.json",
+            self, "Save Session", default_name,
             "Session Files (*.json);;All Files (*)"
         )
         if not path:
             return
+        self._save_last_dir(path)
 
         mem_idx = None
         if self._mem_network is not None:
@@ -3649,11 +3672,12 @@ class SNPViewerApp(QMainWindow):
     def _load_session(self):
         """Load application state from a JSON session file."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", "",
+            self, "Load Session", self._last_dir(),
             "Session Files (*.json);;All Files (*)"
         )
         if not path:
             return
+        self._save_last_dir(path)
 
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -3870,12 +3894,17 @@ class SNPViewerApp(QMainWindow):
 
     def dropEvent(self, event):
         errors = []
+        first_path = None
         for url in event.mimeData().urls():
             fp = url.toLocalFile()
             if fp:
+                if first_path is None:
+                    first_path = fp
                 ok, err = self.file_list.add_network(fp)
                 if not ok:
                     errors.append(f"{os.path.basename(fp)}: {err}")
+        if first_path:
+            self._save_last_dir(first_path)
         if errors:
             QMessageBox.warning(
                 self, "Load Errors",
