@@ -10,3 +10,8 @@ build/
 venv/
 env/
 nul
+
+# Data/output artifacts
+*.csv
+session.json
+.surplus_data/

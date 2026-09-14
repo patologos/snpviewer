@@ -1,6 +1,7 @@
 """
 SNP Viewer - Touchstone/SNP File Viewer and Converter
 A graphical application for loading, visualizing, and converting S-parameter files.
+Optimized build: cached RF conversions, debounced redraws, and fast interactive lookup.
 
 ----------------------------------------------------------------------------
 "THE BEER-WARE LICENSE" (Revision 42):
@@ -12,6 +13,8 @@ this stuff is worth it, you can buy me a beer in return.
 
 import sys
 import os
+import weakref
+from collections import OrderedDict
 import numpy as np
 
 try:
@@ -23,7 +26,7 @@ try:
         QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
         QDialog, QSpinBox, QFormLayout
     )
-    from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize, QSettings
+    from PyQt5.QtCore import Qt, pyqtSignal as Signal, QSize, QSettings, QTimer
     from PyQt5.QtGui import QIcon, QFont, QColor, QPalette, QCursor
     from matplotlib.backends.backend_qt5agg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
@@ -37,7 +40,7 @@ except ImportError:
         QInputDialog, QSizePolicy, QScrollArea, QFrame, QMenu,
         QDialog, QSpinBox, QFormLayout
     )
-    from PySide6.QtCore import Qt, Signal, QSize, QSettings
+    from PySide6.QtCore import Qt, Signal, QSize, QSettings, QTimer
     from PySide6.QtGui import QIcon, QFont, QColor, QPalette, QAction, QCursor
     from matplotlib.backends.backend_qtagg import (
         FigureCanvasQTAgg, NavigationToolbar2QT
@@ -49,6 +52,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 from scipy.signal import find_peaks
+from scipy.spatial import cKDTree
 
 import skrf as rf
 import json
@@ -68,17 +72,19 @@ _FREQ_PREFIXES = [
 ]
 
 
-def auto_freq_scale(freq_hz):
-    """Pick the best engineering prefix for a frequency array in Hz.
-
-    Returns (scaled_array, unit_string).  The chosen prefix is the largest
-    one that keeps the maximum value >= 1.
-    """
+def freq_scale_choice(freq_hz):
+    """Return ``(divisor, unit)`` for a frequency array stored in Hz."""
     f_max = np.max(np.abs(freq_hz)) if len(freq_hz) else 0
     for divisor, unit in _FREQ_PREFIXES:
         if f_max >= divisor:
-            return freq_hz / divisor, unit
-    return freq_hz, 'Hz'
+            return divisor, unit
+    return 1.0, 'Hz'
+
+
+def auto_freq_scale(freq_hz):
+    """Scale a Hz frequency array using a sensible engineering prefix."""
+    divisor, unit = freq_scale_choice(freq_hz)
+    return freq_hz / divisor, unit
 
 
 # ---------------------------------------------------------------------------
@@ -131,11 +137,9 @@ class AppSettings:
     def default_params_for(self, param_type: str) -> list:
         """Return the default (m, n) list for the given param type."""
         pt = param_type.upper()
-        if pt == 'Z':
-            return list(self.z_default_params)
-        if pt == 'Y':
-            return list(self.y_default_params)
-        return list(self.s_default_params)
+        defaults = {'S': self.s_default_params, 'Z': self.z_default_params,
+                    'Y': self.y_default_params}.get(pt, self.s_default_params)
+        return None if defaults is None else list(defaults)
 
     def conf_path(self):
         """Return the path to the loaded conf file, or None."""
@@ -353,6 +357,8 @@ class NatureColors:
             'grid.linestyle': '-',
             'grid.color': '#cccccc',
             'lines.linewidth': 1.8,
+            'path.simplify': True,
+            'agg.path.chunksize': 10000,
             'axes.prop_cycle': plt.cycler('color', NatureColors.CYCLE),
         })
 
@@ -410,7 +416,15 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.setParent(parent)
         self.ax = None
         self._hover_ann = None          # annotation shown on mouse-over
+        self._hover_state = None
         self._square_aspect = False     # force square plot area when True
+        self._ax2 = None                # optional secondary y-axis
+        self._is_smith_chart = False
+        self._network_cache = {}        # weakly keyed derived S/Z/Y/trace cache
+        self._interp_cache = OrderedDict()  # least-recently-used interpolations
+        self._interp_cache_bytes = 0
+        self._interp_cache_limit = 64 * 1024 * 1024
+        self._hover_spatial_cache = {}  # Smith-chart KD-trees, rebuilt per plot
         self.mpl_connect('motion_notify_event', self._on_hover)
 
         # --- Interactive annotation support ---
@@ -428,9 +442,14 @@ class PlotCanvas(FigureCanvasQTAgg):
         self._show_placeholder()
 
     def _clear_fig(self):
-        """Clear the figure and reset all transient per-plot state."""
+        """Clear the figure and reset transient per-plot state/caches."""
         self.fig.clear()
-        self._hover_ann = None          # old annotation is gone with the axes
+        self.ax = None
+        self._ax2 = None
+        self._hover_ann = None
+        self._hover_state = None
+        self._hover_spatial_cache.clear()
+        self._is_smith_chart = False
 
     def _show_placeholder(self):
         """Show a placeholder message when no data is loaded."""
@@ -445,62 +464,196 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.ax.set_yticks([])
         for spine in self.ax.spines.values():
             spine.set_visible(False)
-        self.draw()
+        self.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Cached data helpers
+    # ------------------------------------------------------------------
+
+    def _drop_network_cache(self, cache_id, ref_obj):
+        """Weakref callback used to discard cached arrays for dead Networks."""
+        entry = self._network_cache.get(cache_id)
+        if entry is not None and entry[0] is ref_obj:
+            self._network_cache.pop(cache_id, None)
+        # Interpolations involving that object can no longer be valid.
+        for key in [k for k in self._interp_cache if cache_id in k[:2]]:
+            self._discard_interpolation(key)
+
+    def _cache_for_network(self, network):
+        """Return the small derived-data cache associated with *network*."""
+        cache_id = id(network)
+        entry = self._network_cache.get(cache_id)
+        if entry is not None:
+            ref_obj, values = entry
+            if ref_obj() is network:
+                return values
+
+        try:
+            ref_obj = weakref.ref(
+                network,
+                lambda r, cid=cache_id: self._drop_network_cache(cid, r)
+            )
+        except TypeError:
+            # scikit-rf Network objects are normally weak-referenceable.  Keep
+            # a safe fallback for unusual subclasses.
+            ref_obj = lambda obj=network: obj
+
+        values = {}
+        self._network_cache[cache_id] = (ref_obj, values)
+        return values
+
+    def clear_data_cache(self):
+        """Discard all cached network conversions/derived traces."""
+        self._network_cache.clear()
+        self._interp_cache.clear()
+        self._interp_cache_bytes = 0
+        self._hover_spatial_cache.clear()
+
+    def _network_data(self, network, data_key):
+        """Return cached complex S/Z/Y data for *network*."""
+        cache = self._cache_for_network(network)
+        key = ('data', data_key)
+        if key not in cache:
+            cache[key] = getattr(network, data_key)
+        return cache[key]
+
+    def _network_frequency(self, network):
+        cache = self._cache_for_network(network)
+        key = ('frequency_hz',)
+        if key not in cache:
+            cache[key] = np.asarray(network.frequency.f, dtype=float)
+        return cache[key]
+
+    def _scaled_frequency(self, network, divisor):
+        cache = self._cache_for_network(network)
+        key = ('frequency_scaled', float(divisor))
+        if key not in cache:
+            cache[key] = self._network_frequency(network) / divisor
+        return cache[key]
+
+    def _phase_trace_deg(self, network, m, n):
+        cache = self._cache_for_network(network)
+        key = ('phase_deg', m, n)
+        if key not in cache:
+            cache[key] = np.degrees(np.angle(self._network_data(network, 's')[:, m, n]))
+        return cache[key]
+
+    def _group_delay_trace_ns(self, network, m, n):
+        cache = self._cache_for_network(network)
+        key = ('group_delay_ns', m, n)
+        if key in cache:
+            return cache[key]
+        freq_hz = self._network_frequency(network)
+        if len(freq_hz) <= 1:
+            cache[key] = None
+            return None
+        phase = np.unwrap(np.angle(self._network_data(network, 's')[:, m, n]))
+        omega = 2.0 * np.pi * freq_hz
+        cache[key] = -np.gradient(phase, omega) * 1e9
+        return cache[key]
+
+    @staticmethod
+    def _to_db(values):
+        """Magnitude in dB without allocating an additional ``where`` array."""
+        return 20.0 * np.log10(np.maximum(np.abs(values), 1e-30))
+
+    @staticmethod
+    def _valid_param(data, m, n):
+        return m < data.shape[1] and n < data.shape[2]
+
+    # ------------------------------------------------------------------
+    # Styling helpers that can update the current plot without replots
+    # ------------------------------------------------------------------
+
+    def _data_lines(self):
+        """Yield visible data traces, excluding annotation/helper lines."""
+        axes = [a for a in (self.ax, self._ax2) if a is not None]
+        for ax in axes:
+            for ln in ax.lines:
+                xd = ln.get_xdata()
+                if xd is None or len(xd) <= 2:
+                    continue
+                lbl = ln.get_label() or ''
+                if lbl.startswith('_'):
+                    continue
+                yield ln
+
+    def _apply_markers(self):
+        for i, ln in enumerate(self._data_lines()):
+            if self._markers_enabled:
+                n_pts = len(ln.get_xdata())
+                ln.set_marker(MARKER_STYLES[i % len(MARKER_STYLES)])
+                ln.set_markevery(max(1, n_pts // 12))
+                ln.set_markersize(5)
+                ln.set_markeredgewidth(0.8)
+                ln.set_markerfacecolor(ln.get_color())
+                ln.set_markeredgecolor('white')
+            else:
+                ln.set_marker('None')
+                ln.set_markevery(None)
+
+    def set_markers_enabled(self, enabled):
+        self._markers_enabled = bool(enabled)
+        self._apply_markers()
+        self.draw_idle()
+
+    def _apply_grid_state(self):
+        if self.ax is None or self._is_smith_chart:
+            return
+        self.ax.grid(False, which='both')
+        if self._grid_state == 0:
+            self.ax.minorticks_off()
+        elif self._grid_state == 1:
+            self.ax.minorticks_off()
+            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
+                         color='#cccccc')
+        else:
+            self.ax.minorticks_on()
+            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
+                         color='#cccccc')
+            self.ax.grid(True, which='minor', alpha=0.3, linestyle=':',
+                         color='#cccccc')
+
+    def set_grid_state(self, state):
+        self._grid_state = int(state) % 3
+        self._apply_grid_state()
+        self.draw_idle()
+
+    def _apply_transparency(self):
+        alpha = 0.0 if self._transparent_bg else 1.0
+        self.fig.patch.set_alpha(alpha)
+        for ax in self.fig.axes:
+            ax.patch.set_alpha(alpha)
+            if self._transparent_bg:
+                ax.set_facecolor('none')
+        if not self._transparent_bg and self.ax is not None:
+            self.ax.set_facecolor('#F5F5F5')
+
+    def set_transparent_background(self, enabled):
+        self._transparent_bg = bool(enabled)
+        self._apply_transparency()
+        self.draw_idle()
 
     def _style_axes(self, title=''):
         """Apply Nature-style formatting to the current axes."""
         self.ax.set_title(title, pad=10)
         self.ax.spines['top'].set_visible(False)
         self.ax.spines['right'].set_visible(False)
-        w, _ = self.fig.get_size_inches()
-        if w < 5.0:
-            self.ax.legend(
-                loc='upper center',
-                bbox_to_anchor=(0.5, -0.18),
-                ncol=2, frameon=True, fontsize=plt.rcParams['legend.fontsize'],
-            )
-        else:
-            self.ax.legend(loc='best', frameon=True)
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            w, _ = self.fig.get_size_inches()
+            if w < 5.0:
+                self.ax.legend(
+                    loc='upper center', bbox_to_anchor=(0.5, -0.18),
+                    ncol=2, frameon=True,
+                    fontsize=plt.rcParams['legend.fontsize'],
+                )
+            else:
+                self.ax.legend(loc='best', frameon=True)
         self.ax.set_facecolor('#F5F5F5')
-
-        if self._grid_state == 0:
-            self.ax.grid(False)
-        elif self._grid_state == 1:
-            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
-                         color='#cccccc')
-        else:
-            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
-                         color='#cccccc')
-            self.ax.minorticks_on()
-            self.ax.grid(True, which='minor', alpha=0.3, linestyle=':',
-                         color='#cccccc')
-
-        if self._transparent_bg:
-            self.fig.patch.set_alpha(0)
-            self.ax.patch.set_alpha(0)
-            self.ax.set_facecolor('none')
-        else:
-            self.fig.patch.set_alpha(1.0)
-            self.ax.patch.set_alpha(1.0)
-
-        if self._markers_enabled:
-            for i, ln in enumerate(self.ax.lines):
-                lbl = ln.get_label() or ''
-                if lbl.startswith('_'):
-                    continue
-                xd = ln.get_xdata()
-                if xd is None or len(xd) <= 2:
-                    continue
-                n_pts = len(xd)
-                every = max(1, n_pts // 12)
-                marker = MARKER_STYLES[i % len(MARKER_STYLES)]
-                ln.set_marker(marker)
-                ln.set_markevery(every)
-                ln.set_markersize(5)
-                ln.set_markeredgewidth(0.8)
-                ln.set_markerfacecolor(ln.get_color())
-                ln.set_markeredgecolor('white')
-
+        self._apply_grid_state()
+        self._apply_transparency()
+        self._apply_markers()
         self._apply_aspect()
 
     def _apply_aspect(self):
@@ -519,556 +672,445 @@ class PlotCanvas(FigureCanvasQTAgg):
     # Math Memory support
     # ------------------------------------------------------------------
 
-    def _interp_to_freq(self, ref_network, target_network, ref_data_key):
-        """Interpolate ref_network's complex data onto target_network's
-        frequency grid.  ref_data_key is 's', 'z', or 'y'.
+    def _discard_interpolation(self, key):
+        entry = self._interp_cache.pop(key, None)
+        if entry is not None:
+            self._interp_cache_bytes -= entry[2].nbytes
 
-        Returns a complex array shaped [len(target_freq), n_ports, n_ports]
-        or None if interpolation is impossible.
+    def _interp_to_freq(self, ref_network, target_network, ref_data_key,
+                        param_list=None):
+        """Interpolate complex data, optionally only the requested port pairs.
+
+        A selected result has shape (frequency, parameter); the default retains
+        the full matrix interface. Loaded Networks are treated as immutable.
+        Interpolation results use a 64 MiB / 64-entry LRU cache, and frequencies
+        outside the reference span are clamped to the nearest endpoint.
         """
-        ref_f = ref_network.frequency.f
-        tgt_f = target_network.frequency.f
-        ref_data = getattr(ref_network, ref_data_key)   # complex 3-D array
+        params = None if param_list is None else tuple(param_list)
+        cache_key = (id(ref_network), id(target_network), ref_data_key, params)
+        cached = self._interp_cache.get(cache_key)
+        if cached is not None:
+            ref_ref, tgt_ref, out = cached
+            if ref_ref() is ref_network and tgt_ref() is target_network:
+                self._interp_cache.move_to_end(cache_key)
+                return out
+            self._discard_interpolation(cache_key)
 
-        n_ports_ref = ref_network.number_of_ports
-        n_ports_tgt = target_network.number_of_ports
-        n_ports = min(n_ports_ref, n_ports_tgt)
+        ref_f = self._network_frequency(ref_network)
+        tgt_f = self._network_frequency(target_network)
+        if len(ref_f) == 0:
+            return None
+        ref_data = self._network_data(ref_network, ref_data_key)
+        n_ports = min(ref_network.number_of_ports, target_network.number_of_ports)
+        if params is None:
+            ref_data = ref_data[:, :n_ports, :n_ports]
+        else:
+            rows = np.array([m for m, _ in params], dtype=int)
+            cols = np.array([n for _, n in params], dtype=int)
+            ref_data = ref_data[:, rows, cols]
 
-        out = np.zeros((len(tgt_f), n_ports, n_ports), dtype=complex)
-        for m in range(n_ports):
-            for n in range(n_ports):
-                raw = ref_data[:, m, n]
-                out[:, m, n] = (
-                    np.interp(tgt_f, ref_f, raw.real) +
-                    1j * np.interp(tgt_f, ref_f, raw.imag)
-                )
+        if len(ref_f) == len(tgt_f) and np.array_equal(ref_f, tgt_f):
+            out = ref_data
+        elif len(ref_f) == 1:
+            out = np.broadcast_to(ref_data[0], (len(tgt_f),) + ref_data.shape[1:])
+        else:
+            x = np.clip(tgt_f, ref_f[0], ref_f[-1])
+            hi = np.searchsorted(ref_f, x, side='left')
+            hi = np.clip(hi, 1, len(ref_f) - 1)
+            lo = hi - 1
+            x0 = ref_f[lo]
+            denom = ref_f[hi] - x0
+            weight = np.divide(x - x0, denom, out=np.zeros_like(x),
+                               where=denom != 0)
+            weight = weight.reshape((-1,) + (1,) * (ref_data.ndim - 1))
+            lower = ref_data[lo]
+            out = ref_data[hi] - lower
+            out *= weight
+            out += lower
+
+        if out.nbytes <= self._interp_cache_limit:
+            try:
+                refs = weakref.ref(ref_network), weakref.ref(target_network)
+            except TypeError:
+                return out
+            while self._interp_cache and (
+                    len(self._interp_cache) >= 64 or
+                    self._interp_cache_bytes + out.nbytes > self._interp_cache_limit):
+                self._discard_interpolation(next(iter(self._interp_cache)))
+            self._interp_cache[cache_key] = (*refs, out)
+            self._interp_cache_bytes += out.nbytes
         return out
+
+    def _memory_traces(self, ref_network, network, data_key, param_list):
+        """Return only the memory traces that can actually be plotted."""
+        if ref_network is None or ref_network is network:
+            return {}
+        n_ports = min(ref_network.number_of_ports, network.number_of_ports)
+        params = tuple(sorted({(m, n) for m, n in param_list
+                               if 0 <= m < n_ports and 0 <= n < n_ports}))
+        if not params:
+            return {}
+        data = self._interp_to_freq(ref_network, network, data_key, params)
+        if data is None:
+            return {}
+        return {param: data[:, i] for i, param in enumerate(params)}
+
+    def _plot_parameter_magnitude(self, networks, param_list, data_key,
+                                  symbol, ylabel,
+                                  mem_network=None, diff_only=False):
+        """Shared implementation for S/Z/Y magnitude plots."""
+        self._clear_fig()
+        self.ax = self.fig.add_subplot(111)
+
+        if not param_list or not networks:
+            self._show_no_params()
+            return
+
+        first_f = self._network_frequency(networks[0][1])
+        divisor, freq_unit = freq_scale_choice(first_f)
+        trace_idx = 0
+
+        mem_name = mem_network[0] if mem_network else None
+        mem_net = mem_network[1] if mem_network else None
+
+        if mem_net is not None:
+            mem_data = self._network_data(mem_net, data_key)
+            freq_m = self._scaled_frequency(mem_net, divisor)
+            for m, n in param_list:
+                if not self._valid_param(mem_data, m, n):
+                    continue
+                lbl = f'MEM {mem_name} ${symbol}_{{{m+1}{n+1}}}$'
+                self.ax.plot(
+                    freq_m, self._to_db(mem_data[:, m, n]),
+                    color='#AAAAAA',
+                    linewidth=plt.rcParams['lines.linewidth'] * 0.78,
+                    linestyle='--', label=lbl, alpha=0.75,
+                )
+
+        for file_idx, (name, network) in enumerate(networks):
+            freq = self._scaled_frequency(network, divisor)
+            data = self._network_data(network, data_key)
+            mem_interp = self._memory_traces(mem_net, network, data_key, param_list)
+
+            for m, n in param_list:
+                if not self._valid_param(data, m, n):
+                    continue
+                color = NatureColors.get_color(trace_idx)
+                raw = data[:, m, n]
+                if not diff_only:
+                    self.ax.plot(
+                        freq, self._to_db(raw), color=color,
+                        label=f'{name} ${symbol}_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=NatureColors.get_linestyle(file_idx),
+                    )
+                if (m, n) in mem_interp:
+                    self.ax.plot(
+                        freq, self._to_db(raw - mem_interp[m, n]),
+                        color=color,
+                        label=f'Δ{name} ${symbol}_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=':', alpha=0.9,
+                    )
+                trace_idx += 1
+
+        self.ax.set_xlabel(f'Frequency ({freq_unit})')
+        self.ax.set_ylabel(ylabel)
+        self._style_axes()
+        self.draw_idle()
 
     def plot_magnitude(self, networks, param_list,
                        mem_network=None, diff_only=False):
-        """Plot S-parameters in dB for multiple networks.
-        networks: list of (short_name, Network) tuples.
-        mem_network: optional (name, Network) memory reference tuple.
-        diff_only: if True, plot only differential traces (not raw traces).
-        """
-        self._clear_fig()
-        self.ax = self.fig.add_subplot(111)
-
-        if not param_list or not networks:
-            self._show_no_params()
-            return
-
-        trace_idx = 0
-        multi = len(networks) > 1
-        # Determine best unit from the first network's raw Hz values
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
-        # Pre-compute memory reference data if set
-        mem_name = mem_network[0] if mem_network else None
-        mem_net = mem_network[1] if mem_network else None
-
-        # Plot memory reference trace (always shown when memory is set)
-        if mem_net is not None:
-            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
-            n_ports_m = mem_net.number_of_ports
-            for m, n in param_list:
-                if m >= n_ports_m or n >= n_ports_m:
-                    continue
-                s_mag = np.abs(mem_net.s[:, m, n])
-                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
-                lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
-                self.ax.plot(freq_m, s_db,
-                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
-                             linestyle='--', label=lbl, alpha=0.75)
-
-        for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
-            n_ports = network.number_of_ports
-            is_mem_self = (network is mem_net)
-
-            # Compute interpolated memory data for this network (if set),
-            # but not when this network IS the memory (would be self - self = 0)
-            mem_interp = None
-            if mem_net is not None and not is_mem_self:
-                mem_interp = self._interp_to_freq(mem_net, network, 's')
-
-            for m, n in param_list:
-                if m >= n_ports or n >= n_ports:
-                    continue
-                color = NatureColors.get_color(trace_idx)
-                linestyle = NatureColors.get_linestyle(file_idx)
-
-                # Raw trace
-                s_raw = network.s[:, m, n]
-                s_mag = np.abs(s_raw)
-                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
-
-                if not diff_only:
-                    label = f'{name} $S_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, s_db, color=color,
-                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=linestyle)
-
-                # Differential trace (skip when this network is the memory itself)
-                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
-                    diff_raw = s_raw - mem_interp[:, m, n]
-                    diff_mag = np.abs(diff_raw)
-                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=':', alpha=0.9)
-
-                trace_idx += 1
-
-        self.ax.set_xlabel(f'Frequency ({freq_unit})')
-        self.ax.set_ylabel('Magnitude (dB)')
-        self._style_axes()
-        self.draw()
+        self._plot_parameter_magnitude(
+            networks, param_list, 's', 'S', 'Magnitude (dB)',
+            mem_network=mem_network, diff_only=diff_only,
+        )
 
     def plot_z_magnitude(self, networks, param_list,
                          mem_network=None, diff_only=False):
-        """Plot Z-parameters magnitude (dB) for multiple networks."""
-        self._clear_fig()
-        self.ax = self.fig.add_subplot(111)
-
-        if not param_list or not networks:
-            self._show_no_params()
-            return
-
-        trace_idx = 0
-        multi = len(networks) > 1
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
-        mem_name = mem_network[0] if mem_network else None
-        mem_net = mem_network[1] if mem_network else None
-
-        if mem_net is not None:
-            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
-            n_ports_m = mem_net.number_of_ports
-            for m, n in param_list:
-                if m >= n_ports_m or n >= n_ports_m:
-                    continue
-                z_mag = np.abs(mem_net.z[:, m, n])
-                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
-                lbl = f'MEM {mem_name} $Z_{{{m+1}{n+1}}}$'
-                self.ax.plot(freq_m, z_db,
-                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
-                             linestyle='--', label=lbl, alpha=0.75)
-
-        for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
-            n_ports = network.number_of_ports
-            mem_interp = None
-            if mem_net is not None and network is not mem_net:
-                mem_interp = self._interp_to_freq(mem_net, network, 'z')
-            for m, n in param_list:
-                if m >= n_ports or n >= n_ports:
-                    continue
-                color = NatureColors.get_color(trace_idx)
-                linestyle = NatureColors.get_linestyle(file_idx)
-                z_raw = network.z[:, m, n]
-                z_mag = np.abs(z_raw)
-                z_db = 20 * np.log10(np.where(z_mag == 0, 1e-30, z_mag))
-                if not diff_only:
-                    label = f'{name} $Z_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, z_db, color=color,
-                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=linestyle)
-                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
-                    diff_raw = z_raw - mem_interp[:, m, n]
-                    diff_mag = np.abs(diff_raw)
-                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} $Z_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=':', alpha=0.9)
-                trace_idx += 1
-
-        self.ax.set_xlabel(f'Frequency ({freq_unit})')
-        self.ax.set_ylabel('$|Z|$ (dB$\\Omega$)')
-        self._style_axes()
-        self.draw()
+        self._plot_parameter_magnitude(
+            networks, param_list, 'z', 'Z', r'$|Z|$ (dB$\Omega$)',
+            mem_network=mem_network, diff_only=diff_only,
+        )
 
     def plot_y_magnitude(self, networks, param_list,
                          mem_network=None, diff_only=False):
-        """Plot Y-parameters magnitude (dB) for multiple networks."""
-        self._clear_fig()
-        self.ax = self.fig.add_subplot(111)
-
-        if not param_list or not networks:
-            self._show_no_params()
-            return
-
-        trace_idx = 0
-        multi = len(networks) > 1
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
-        mem_name = mem_network[0] if mem_network else None
-        mem_net = mem_network[1] if mem_network else None
-
-        if mem_net is not None:
-            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
-            n_ports_m = mem_net.number_of_ports
-            for m, n in param_list:
-                if m >= n_ports_m or n >= n_ports_m:
-                    continue
-                y_mag = np.abs(mem_net.y[:, m, n])
-                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
-                lbl = f'MEM {mem_name} $Y_{{{m+1}{n+1}}}$'
-                self.ax.plot(freq_m, y_db,
-                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
-                             linestyle='--', label=lbl, alpha=0.75)
-
-        for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
-            n_ports = network.number_of_ports
-            mem_interp = None
-            if mem_net is not None and network is not mem_net:
-                mem_interp = self._interp_to_freq(mem_net, network, 'y')
-            for m, n in param_list:
-                if m >= n_ports or n >= n_ports:
-                    continue
-                color = NatureColors.get_color(trace_idx)
-                linestyle = NatureColors.get_linestyle(file_idx)
-                y_raw = network.y[:, m, n]
-                y_mag = np.abs(y_raw)
-                y_db = 20 * np.log10(np.where(y_mag == 0, 1e-30, y_mag))
-                if not diff_only:
-                    label = f'{name} $Y_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, y_db, color=color,
-                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=linestyle)
-                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
-                    diff_raw = y_raw - mem_interp[:, m, n]
-                    diff_mag = np.abs(diff_raw)
-                    diff_db = 20 * np.log10(np.where(diff_mag == 0, 1e-30, diff_mag))
-                    diff_lbl = f'\u0394{name} $Y_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, diff_db, color=color,
-                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=':', alpha=0.9)
-                trace_idx += 1
-
-        self.ax.set_xlabel(f'Frequency ({freq_unit})')
-        self.ax.set_ylabel('$|Y|$ (dBS)')
-        self._style_axes()
-        self.draw()
+        self._plot_parameter_magnitude(
+            networks, param_list, 'y', 'Y', r'$|Y|$ (dBS)',
+            mem_network=mem_network, diff_only=diff_only,
+        )
 
     def plot_phase(self, networks, param_list,
                    mem_network=None, diff_only=False):
-        """Plot S-parameters phase in degrees for multiple networks."""
+        """Plot S-parameter phase in degrees for multiple networks."""
         self._clear_fig()
         self.ax = self.fig.add_subplot(111)
-
         if not param_list or not networks:
             self._show_no_params()
             return
 
+        divisor, freq_unit = freq_scale_choice(self._network_frequency(networks[0][1]))
         trace_idx = 0
-        multi = len(networks) > 1
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
         mem_name = mem_network[0] if mem_network else None
         mem_net = mem_network[1] if mem_network else None
 
         if mem_net is not None:
-            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            freq_m = self._scaled_frequency(mem_net, divisor)
             n_ports_m = mem_net.number_of_ports
             for m, n in param_list:
                 if m >= n_ports_m or n >= n_ports_m:
                     continue
-                lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
-                self.ax.plot(freq_m, mem_net.s_deg[:, m, n],
-                             color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
-                             linestyle='--', label=lbl, alpha=0.75)
+                self.ax.plot(
+                    freq_m, self._phase_trace_deg(mem_net, m, n),
+                    color='#AAAAAA',
+                    linewidth=plt.rcParams['lines.linewidth'] * 0.78,
+                    linestyle='--',
+                    label=f'MEM {mem_name} $S_{{{m+1}{n+1}}}$', alpha=0.75,
+                )
 
         for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
+            freq = self._scaled_frequency(network, divisor)
             n_ports = network.number_of_ports
-            mem_interp = None
-            if mem_net is not None and network is not mem_net:
-                mem_interp = self._interp_to_freq(mem_net, network, 's')
+            mem_interp = self._memory_traces(mem_net, network, 's', param_list)
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
-                linestyle = NatureColors.get_linestyle(file_idx)
-                s_deg = network.s_deg[:, m, n]
+                phase = self._phase_trace_deg(network, m, n)
                 if not diff_only:
-                    label = f'{name} $S_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, s_deg, color=color,
-                                 label=label, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=linestyle)
-                if mem_interp is not None and m < mem_interp.shape[1] and n < mem_interp.shape[2]:
-                    mem_deg = np.degrees(np.angle(mem_interp[:, m, n]))
-                    diff_deg = s_deg - mem_deg
-                    diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq, diff_deg, color=color,
-                                 label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
-                                 linestyle=':', alpha=0.9)
+                    self.ax.plot(
+                        freq, phase, color=color,
+                        label=f'{name} $S_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=NatureColors.get_linestyle(file_idx),
+                    )
+                if (m, n) in mem_interp:
+                    mem_phase = np.degrees(np.angle(mem_interp[m, n]))
+                    self.ax.plot(
+                        freq, phase - mem_phase, color=color,
+                        label=f'Δ{name} $S_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=':', alpha=0.9,
+                    )
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Phase (degrees)')
         self._style_axes()
-        self.draw()
+        self.draw_idle()
 
     def plot_smith(self, networks, param_list):
         """Plot S-parameters on a Smith chart for multiple networks."""
         self._clear_fig()
         self.ax = self.fig.add_subplot(111)
-
+        self._is_smith_chart = True
         if not param_list or not networks:
             self._show_no_params()
             return
 
         trace_idx = 0
-        multi = len(networks) > 1
         first_drawn = False
-
         for name, network in networks:
             n_ports = network.number_of_ports
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
-                color = NatureColors.get_color(trace_idx)
-                label = f'{name} $S_{{{m+1}{n+1}}}$'
                 network.plot_s_smith(
-                    m=m, n=n, ax=self.ax, color=color,
-                    label=label, linewidth=plt.rcParams['lines.linewidth'],
+                    m=m, n=n, ax=self.ax,
+                    color=NatureColors.get_color(trace_idx),
+                    label=f'{name} $S_{{{m+1}{n+1}}}$',
+                    linewidth=plt.rcParams['lines.linewidth'],
                     draw_labels=(not first_drawn), chart_type='z'
                 )
                 first_drawn = True
                 trace_idx += 1
 
-        w, _ = self.fig.get_size_inches()
-        if w < 5.0:
-            self.ax.legend(
-                loc='upper center',
-                bbox_to_anchor=(0.5, -0.05),
-                ncol=2, frameon=True,
-                fontsize=plt.rcParams['legend.fontsize'],
-            )
-        else:
-            self.ax.legend(loc='upper right', frameon=True)
+        handles, _ = self.ax.get_legend_handles_labels()
+        if handles:
+            w, _ = self.fig.get_size_inches()
+            if w < 5.0:
+                self.ax.legend(
+                    loc='upper center', bbox_to_anchor=(0.5, -0.05),
+                    ncol=2, frameon=True,
+                    fontsize=plt.rcParams['legend.fontsize'],
+                )
+            else:
+                self.ax.legend(loc='upper right', frameon=True)
+        self._apply_transparency()
+        self._apply_markers()
         self._apply_aspect()
-        self.draw()
+        self.draw_idle()
 
     def plot_vswr(self, networks, param_list):
         """Plot VSWR for multiple networks."""
         self._clear_fig()
         self.ax = self.fig.add_subplot(111)
-
         if not param_list or not networks:
             self._show_no_params()
             return
 
+        divisor, freq_unit = freq_scale_choice(self._network_frequency(networks[0][1]))
         trace_idx = 0
-        multi = len(networks) > 1
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
         for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
+            freq = self._scaled_frequency(network, divisor)
+            data = self._network_data(network, 's')
             n_ports = network.number_of_ports
             for m, n in param_list:
-                if m >= n_ports or n >= n_ports:
+                if m >= n_ports or n >= n_ports or m != n:
                     continue
-                if m != n:
-                    continue  # VSWR only meaningful for Snn
-                color = NatureColors.get_color(trace_idx)
-                s_mag = np.abs(network.s[:, m, n])
-                vswr = (1 + s_mag) / (1 - s_mag)
+                mag = np.abs(data[:, m, n])
+                denom = 1.0 - mag
+                vswr = np.divide(
+                    1.0 + mag, denom,
+                    out=np.full_like(mag, 100.0, dtype=float),
+                    where=denom > 0,
+                )
                 vswr = np.clip(vswr, 1, 100)
-                label = f'{name} VSWR($S_{{{m+1}{n+1}}}$)'
-                self.ax.plot(freq, vswr, color=color,
-                             label=label, linewidth=plt.rcParams['lines.linewidth'],
-                             linestyle=NatureColors.get_linestyle(file_idx))
+                self.ax.plot(
+                    freq, vswr, color=NatureColors.get_color(trace_idx),
+                    label=f'{name} VSWR($S_{{{m+1}{n+1}}}$)',
+                    linewidth=plt.rcParams['lines.linewidth'],
+                    linestyle=NatureColors.get_linestyle(file_idx),
+                )
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('VSWR')
         self.ax.set_ylim(bottom=1)
         self._style_axes()
-        self.draw()
+        self.draw_idle()
 
     def plot_group_delay(self, networks, param_list,
                          mem_network=None, diff_only=False):
         """Plot group delay for multiple networks."""
         self._clear_fig()
         self.ax = self.fig.add_subplot(111)
-
         if not param_list or not networks:
             self._show_no_params()
             return
 
+        divisor, freq_unit = freq_scale_choice(self._network_frequency(networks[0][1]))
         trace_idx = 0
-        multi = len(networks) > 1
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
         mem_name = mem_network[0] if mem_network else None
         mem_net = mem_network[1] if mem_network else None
 
-        def _group_delay_ns(network, m, n):
-            s_phase_rad = np.unwrap(np.angle(network.s[:, m, n]))
-            omega = 2 * np.pi * network.frequency.f
-            if len(omega) > 1:
-                return -np.gradient(s_phase_rad, omega) * 1e9
-            return None
-
         if mem_net is not None:
-            freq_m, _ = auto_freq_scale(mem_net.frequency.f)
+            freq_m = self._scaled_frequency(mem_net, divisor)
             n_ports_m = mem_net.number_of_ports
             for m, n in param_list:
                 if m >= n_ports_m or n >= n_ports_m:
                     continue
-                gd = _group_delay_ns(mem_net, m, n)
+                gd = self._group_delay_trace_ns(mem_net, m, n)
                 if gd is not None:
-                    lbl = f'MEM {mem_name} $S_{{{m+1}{n+1}}}$'
-                    self.ax.plot(freq_m, gd,
-                                 color='#AAAAAA', linewidth=plt.rcParams['lines.linewidth'] * 0.78,
-                                 linestyle='--', label=lbl, alpha=0.75)
+                    self.ax.plot(
+                        freq_m, gd, color='#AAAAAA',
+                        linewidth=plt.rcParams['lines.linewidth'] * 0.78,
+                        linestyle='--',
+                        label=f'MEM {mem_name} $S_{{{m+1}{n+1}}}$', alpha=0.75,
+                    )
 
         for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
+            freq = self._scaled_frequency(network, divisor)
             n_ports = network.number_of_ports
-            mem_interp = None
-            if mem_net is not None and network is not mem_net:
-                mem_interp = self._interp_to_freq(mem_net, network, 's')
+            mem_interp = self._memory_traces(mem_net, network, 's', param_list)
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
+                gd = self._group_delay_trace_ns(network, m, n)
+                if gd is None:
+                    continue
                 color = NatureColors.get_color(trace_idx)
-                linestyle = NatureColors.get_linestyle(file_idx)
-                gd = _group_delay_ns(network, m, n)
-                if gd is not None:
-                    if not diff_only:
-                        label = f'{name} $S_{{{m+1}{n+1}}}$'
-                        self.ax.plot(freq, gd, color=color,
-                                     label=label, linewidth=plt.rcParams['lines.linewidth'],
-                                     linestyle=linestyle)
-                    if (mem_interp is not None
-                            and m < mem_interp.shape[1]
-                            and n < mem_interp.shape[2]):
-                        # Reconstruct a temporary network-like object for mem GD
-                        mem_phase_rad = np.unwrap(np.angle(mem_interp[:, m, n]))
-                        omega = 2 * np.pi * network.frequency.f
-                        mem_gd = -np.gradient(mem_phase_rad, omega) * 1e9
-                        diff_lbl = f'\u0394{name} $S_{{{m+1}{n+1}}}$'
-                        self.ax.plot(freq, gd - mem_gd, color=color,
-                                     label=diff_lbl, linewidth=plt.rcParams['lines.linewidth'],
-                                     linestyle=':', alpha=0.9)
+                if not diff_only:
+                    self.ax.plot(
+                        freq, gd, color=color,
+                        label=f'{name} $S_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=NatureColors.get_linestyle(file_idx),
+                    )
+                if (m, n) in mem_interp:
+                    mem_phase = np.unwrap(np.angle(mem_interp[m, n]))
+                    omega = 2.0 * np.pi * self._network_frequency(network)
+                    mem_gd = -np.gradient(mem_phase, omega) * 1e9
+                    self.ax.plot(
+                        freq, gd - mem_gd, color=color,
+                        label=f'Δ{name} $S_{{{m+1}{n+1}}}$',
+                        linewidth=plt.rcParams['lines.linewidth'],
+                        linestyle=':', alpha=0.9,
+                    )
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Group Delay (ns)')
         self._style_axes()
-        self.draw()
+        self.draw_idle()
 
     def plot_mag_phase(self, networks, param_list,
                        mem_network=None, diff_only=False):
         """Plot magnitude (left y-axis) and phase (right y-axis) overlaid."""
         self._clear_fig()
         self.ax = self.fig.add_subplot(111)
-
         if not param_list or not networks:
             self._show_no_params()
             return
 
-        trace_idx = 0
-        _, freq_unit = auto_freq_scale(networks[0][1].frequency.f)
-
+        divisor, freq_unit = freq_scale_choice(self._network_frequency(networks[0][1]))
         ax2 = self.ax.twinx()
         self._ax2 = ax2
-
+        trace_idx = 0
         mag_handles, mag_labels = [], []
         phase_handles, phase_labels = [], []
 
         for file_idx, (name, network) in enumerate(networks):
-            freq, _ = auto_freq_scale(network.frequency.f)
+            freq = self._scaled_frequency(network, divisor)
+            data = self._network_data(network, 's')
             n_ports = network.number_of_ports
-
             for m, n in param_list:
                 if m >= n_ports or n >= n_ports:
                     continue
                 color = NatureColors.get_color(trace_idx)
                 linestyle = NatureColors.get_linestyle(file_idx)
-
-                s_mag = np.abs(network.s[:, m, n])
-                s_db = 20 * np.log10(np.where(s_mag == 0, 1e-30, s_mag))
                 mag_lbl = f'{name} $|S_{{{m+1}{n+1}}}|$'
-                h_mag, = self.ax.plot(freq, s_db, color=color,
-                                      label=mag_lbl,
-                                      linewidth=plt.rcParams['lines.linewidth'],
-                                      linestyle=linestyle)
+                h_mag, = self.ax.plot(
+                    freq, self._to_db(data[:, m, n]), color=color,
+                    label=mag_lbl, linewidth=plt.rcParams['lines.linewidth'],
+                    linestyle=linestyle,
+                )
                 mag_handles.append(h_mag)
                 mag_labels.append(mag_lbl)
 
-                s_deg = network.s_deg[:, m, n]
                 phase_lbl = f'{name} $\\angle S_{{{m+1}{n+1}}}$'
-                h_phase, = ax2.plot(freq, s_deg, color=color,
-                                    label=phase_lbl,
-                                    linewidth=plt.rcParams['lines.linewidth'],
-                                    linestyle='--', alpha=0.7)
+                h_phase, = ax2.plot(
+                    freq, self._phase_trace_deg(network, m, n), color=color,
+                    label=phase_lbl, linewidth=plt.rcParams['lines.linewidth'],
+                    linestyle='--', alpha=0.7,
+                )
                 phase_handles.append(h_phase)
                 phase_labels.append(phase_lbl)
-
                 trace_idx += 1
 
         self.ax.set_xlabel(f'Frequency ({freq_unit})')
         self.ax.set_ylabel('Magnitude (dB)')
         ax2.set_ylabel('Phase (degrees)')
-
         self.ax.set_title('', pad=10)
         self.ax.spines['top'].set_visible(False)
         ax2.spines['top'].set_visible(False)
         self.ax.set_facecolor('#F5F5F5')
-
-        if self._grid_state >= 1:
-            self.ax.grid(True, which='major', alpha=0.5, linestyle='-',
-                         color='#cccccc')
-        if self._grid_state >= 2:
-            self.ax.minorticks_on()
-            self.ax.grid(True, which='minor', alpha=0.3, linestyle=':',
-                         color='#cccccc')
-
-        if self._transparent_bg:
-            self.fig.patch.set_alpha(0)
-            self.ax.patch.set_alpha(0)
-            self.ax.set_facecolor('none')
-        else:
-            self.fig.patch.set_alpha(1.0)
-            self.ax.patch.set_alpha(1.0)
+        self._apply_grid_state()
+        self._apply_transparency()
 
         if mag_handles:
-            self.ax.legend(mag_handles, mag_labels,
-                           loc='upper left', frameon=True,
-                           fontsize=plt.rcParams['legend.fontsize'])
+            self.ax.legend(
+                mag_handles, mag_labels, loc='upper left', frameon=True,
+                fontsize=plt.rcParams['legend.fontsize']
+            )
         if phase_handles:
-            ax2.legend(phase_handles, phase_labels,
-                       loc='upper right', frameon=True,
-                       fontsize=plt.rcParams['legend.fontsize'])
-
-        if self._markers_enabled:
-            all_lines = list(self.ax.lines) + list(ax2.lines)
-            for i, ln in enumerate(all_lines):
-                lbl = ln.get_label() or ''
-                if lbl.startswith('_'):
-                    continue
-                xd = ln.get_xdata()
-                if xd is None or len(xd) <= 2:
-                    continue
-                n_pts = len(xd)
-                every = max(1, n_pts // 12)
-                marker = MARKER_STYLES[i % len(MARKER_STYLES)]
-                ln.set_marker(marker)
-                ln.set_markevery(every)
-                ln.set_markersize(5)
-                ln.set_markeredgewidth(0.8)
-                ln.set_markerfacecolor(ln.get_color())
-                ln.set_markeredgecolor('white')
-
+            ax2.legend(
+                phase_handles, phase_labels, loc='upper right', frameon=True,
+                fontsize=plt.rcParams['legend.fontsize']
+            )
+        self._apply_markers()
         self._apply_aspect()
-        self.draw()
+        self.draw_idle()
 
     def _show_no_params(self):
         """Show message when no parameters are selected."""
@@ -1164,59 +1206,66 @@ class PlotCanvas(FigureCanvasQTAgg):
         return f"{hz:.4g} Hz"
 
     def _compute_q_one_trace(self, xdata, ydata, xmin, xmax):
-        """Compute Q for a single (xdata, ydata) trace within [xmin, xmax].
+        """Compute Q for one trace within [xmin, xmax].
 
-        Returns a dict on success, or None if the 3 dB crossings cannot be
-        found.
+        Uses ``searchsorted`` for monotonic frequency axes so selecting a small
+        span in a 100k+ point sweep does not allocate/scan a full-length mask.
         """
-        mask = (xdata >= xmin) & (xdata <= xmax)
-        if mask.sum() < 3:
+        xdata = np.asarray(xdata, dtype=float)
+        ydata = np.asarray(ydata, dtype=float)
+        if len(xdata) < 3:
             return None
 
-        xr = xdata[mask]
-        yr = ydata[mask]
+        if xdata[0] <= xdata[-1]:
+            i0 = int(np.searchsorted(xdata, xmin, side='left'))
+            i1 = int(np.searchsorted(xdata, xmax, side='right'))
+            xr = xdata[i0:i1]
+            yr = ydata[i0:i1]
+        else:
+            mask = (xdata >= xmin) & (xdata <= xmax)
+            xr, yr = xdata[mask], ydata[mask]
 
-        # Peak = maximum dB in range
+        if len(xr) < 3:
+            return None
+
         peak_idx = int(np.argmax(yr))
         f0 = xr[peak_idx]
         peak_db = yr[peak_idx]
         half_power_db = peak_db - 3.0
 
-        # Left 3 dB crossing (search left of peak)
-        left_f = None
-        for i in range(peak_idx, 0, -1):
-            if yr[i - 1] <= half_power_db:
-                dx = xr[i] - xr[i - 1]
-                dy = yr[i] - yr[i - 1]
-                if dy != 0:
-                    left_f = xr[i - 1] + (half_power_db - yr[i - 1]) * dx / dy
-                break
-
-        # Right 3 dB crossing (search right of peak)
-        right_f = None
-        for i in range(peak_idx, len(xr) - 1):
-            if yr[i + 1] <= half_power_db:
-                dx = xr[i + 1] - xr[i]
-                dy = yr[i + 1] - yr[i]
-                if dy != 0:
-                    right_f = xr[i] + (half_power_db - yr[i]) * dx / dy
-                break
-
-        if left_f is None or right_f is None:
+        # Last point at/below -3 dB to the left, then interpolate to the peak.
+        left_candidates = np.flatnonzero(yr[:peak_idx] <= half_power_db)
+        if len(left_candidates) == 0:
             return None
+        li = int(left_candidates[-1])
+        if li + 1 >= len(xr):
+            return None
+        dx = xr[li + 1] - xr[li]
+        dy = yr[li + 1] - yr[li]
+        if dy == 0:
+            return None
+        left_f = xr[li] + (half_power_db - yr[li]) * dx / dy
+
+        # First point at/below -3 dB to the right.
+        right_candidates = np.flatnonzero(yr[peak_idx + 1:] <= half_power_db)
+        if len(right_candidates) == 0:
+            return None
+        ri = peak_idx + 1 + int(right_candidates[0])
+        if ri <= 0:
+            return None
+        dx = xr[ri] - xr[ri - 1]
+        dy = yr[ri] - yr[ri - 1]
+        if dy == 0:
+            return None
+        right_f = xr[ri - 1] + (half_power_db - yr[ri - 1]) * dx / dy
 
         bw = right_f - left_f
         if bw <= 0:
             return None
-
         return {
-            'f0': f0,
-            'bw': bw,
-            'q': f0 / bw,
-            'peak_db': peak_db,
-            'half_power_db': half_power_db,
-            'left_f': left_f,
-            'right_f': right_f,
+            'f0': f0, 'bw': bw, 'q': f0 / bw,
+            'peak_db': peak_db, 'half_power_db': half_power_db,
+            'left_f': left_f, 'right_f': right_f,
         }
 
     def _compute_q_all_traces(self, xmin, xmax):
@@ -1549,44 +1598,100 @@ class PlotCanvas(FigureCanvasQTAgg):
     # Hover tooltip
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _nearest_x_index(xdata, x):
+        """Nearest index on a monotonic frequency axis in O(log N)."""
+        n = len(xdata)
+        if n == 0:
+            return None
+        if n == 1:
+            return 0
+        if xdata[0] <= xdata[-1]:
+            i = int(np.searchsorted(xdata, x, side='left'))
+            if i <= 0:
+                return 0
+            if i >= n:
+                return n - 1
+            return i - 1 if abs(x - xdata[i - 1]) <= abs(xdata[i] - x) else i
+        # Descending/non-standard traces are uncommon for Touchstone files.
+        return int(np.argmin(np.abs(xdata - x)))
+
+    def _smith_nearest_index(self, ln, x, y):
+        """Nearest Smith-chart point using a KD-tree built once per line."""
+        cache_key = id(ln)
+        entry = self._hover_spatial_cache.get(cache_key)
+        if entry is None:
+            xd = np.asarray(ln.get_xdata(), dtype=float)
+            yd = np.asarray(ln.get_ydata(), dtype=float)
+            finite = np.isfinite(xd) & np.isfinite(yd)
+            indices = np.flatnonzero(finite)
+            if len(indices) == 0:
+                return None
+            tree = cKDTree(np.column_stack((xd[finite], yd[finite])))
+            entry = (tree, indices)
+            self._hover_spatial_cache[cache_key] = entry
+        tree, indices = entry
+        _, local_idx = tree.query((x, y), k=1)
+        return int(indices[int(local_idx)])
+
     def _on_hover(self, event):
-        """Show a data-point tooltip when the cursor is near a plotted line."""
-        if self.ax is None or event.inaxes != self.ax:
+        """Show a tooltip near the closest plotted data point.
+
+        Frequency plots use binary search plus a tiny local candidate window;
+        Smith charts use cached KD-trees.  This avoids scanning every point on
+        every mouse-move event.
+        """
+        if (self.ax is None or event.inaxes != self.ax or
+                event.xdata is None or event.ydata is None):
             self._hide_hover()
             return
 
-        PIXEL_THRESH = 20           # snap radius in screen pixels
-        best_dist = PIXEL_THRESH + 1
+        pixel_thresh = 20.0
+        best_dist = pixel_thresh + 1.0
         best_x = best_y = best_label = best_color = None
-
-        xmin, xmax = self.ax.get_xlim()
+        is_frequency_plot = bool(self._get_freq_unit())
 
         for ln in self.ax.lines:
             xd = ln.get_xdata()
             yd = ln.get_ydata()
             if xd is None or len(xd) <= 2:
-                continue                     # skip axhline / axvline markers
+                continue
             lbl = ln.get_label() or ''
             if lbl.startswith('_'):
-                continue                     # skip internal matplotlib lines
-
+                continue
             xd = np.asarray(xd, dtype=float)
             yd = np.asarray(yd, dtype=float)
 
-            # Restrict to the currently visible x-range for speed
-            vis = (xd >= xmin) & (xd <= xmax)
-            if not vis.any():
-                continue
-            xd_v, yd_v = xd[vis], yd[vis]
+            if is_frequency_plot:
+                center = self._nearest_x_index(xd, event.xdata)
+                if center is None:
+                    continue
+                lo = max(0, center - 3)
+                hi = min(len(xd), center + 4)
+                candidate_idx = np.arange(lo, hi)
+            else:
+                idx = self._smith_nearest_index(ln, event.xdata, event.ydata)
+                if idx is None:
+                    continue
+                candidate_idx = np.array([idx], dtype=int)
 
-            # Convert data coords → display (pixel) coords, measure distance
-            pts = self.ax.transData.transform(np.column_stack([xd_v, yd_v]))
+            cx = xd[candidate_idx]
+            cy = yd[candidate_idx]
+            finite = np.isfinite(cx) & np.isfinite(cy)
+            if not finite.any():
+                continue
+            candidate_idx = candidate_idx[finite]
+            pts = self.ax.transData.transform(
+                np.column_stack((xd[candidate_idx], yd[candidate_idx]))
+            )
             dists = np.hypot(pts[:, 0] - event.x, pts[:, 1] - event.y)
-            idx = int(np.argmin(dists))
-            if dists[idx] < best_dist:
-                best_dist = dists[idx]
-                best_x    = xd_v[idx]
-                best_y    = yd_v[idx]
+            local = int(np.argmin(dists))
+            dist = float(dists[local])
+            if dist < best_dist:
+                idx = int(candidate_idx[local])
+                best_dist = dist
+                best_x = xd[idx]
+                best_y = yd[idx]
                 best_label = lbl
                 best_color = ln.get_color()
 
@@ -1594,19 +1699,22 @@ class PlotCanvas(FigureCanvasQTAgg):
             self._hide_hover()
             return
 
-        # Build tooltip text
         f_unit = self._get_freq_unit()
-        if f_unit:                           # frequency-based plot
+        if f_unit:
             text = f'{best_x:.5g} {f_unit}\n{best_y:.4g}'
-        else:                               # Smith chart — show Re / Im
+        else:
             text = f'Re: {best_x:.4g}\nIm: {best_y:.4g}'
         if best_label and not best_label.startswith('_'):
             text = f'{best_label}\n' + text
-
         self._show_hover(best_x, best_y, text, best_color or '#555555')
 
     def _show_hover(self, x, y, text, color):
         """Create or update the hover annotation at data point (x, y)."""
+        state = (x, y, text, color)
+        if (state == self._hover_state and self._hover_ann is not None
+                and self._hover_ann.get_visible()):
+            return
+        self._hover_state = state
         if self._hover_ann is None:
             self._hover_ann = self.ax.annotate(
                 text,
@@ -1995,10 +2103,12 @@ class PlotCanvas(FigureCanvasQTAgg):
             if lbl.startswith('_'):
                 continue
             xd = np.asarray(xd, dtype=float)
-            dists = np.abs(xd - event.xdata)
-            idx = int(np.argmin(dists))
-            if dists[idx] < best_dist:
-                best_dist = dists[idx]
+            idx = self._nearest_x_index(xd, event.xdata)
+            if idx is None:
+                continue
+            dist = abs(xd[idx] - event.xdata)
+            if dist < best_dist:
+                best_dist = dist
                 best_x = xd[idx]
 
         cursor_idx = len(self._cursors) % 2
@@ -2007,7 +2117,6 @@ class PlotCanvas(FigureCanvasQTAgg):
 
         artists = []
         f_unit = self._get_freq_unit()
-
         vline = self.ax.axvline(best_x, color='#555555', linestyle='--',
                                 linewidth=1.0, alpha=0.8, zorder=10)
         artists.append(vline)
@@ -2023,20 +2132,16 @@ class PlotCanvas(FigureCanvasQTAgg):
                 continue
             xd = np.asarray(xd, dtype=float)
             yd = np.asarray(yd, dtype=float)
-            idx = int(np.argmin(np.abs(xd - best_x)))
-            val = yd[idx]
-            readout_lines.append(f'  {lbl}: {val:.4g}')
+            idx = self._nearest_x_index(xd, best_x)
+            if idx is not None:
+                readout_lines.append(f'  {lbl}: {yd[idx]:.4g}')
 
-        readout_text = '\n'.join(readout_lines)
         y_pos = 0.95 - cursor_idx * 0.35
         x_pos = 0.98 if cursor_idx == 1 else 0.02
         ha = 'right' if cursor_idx == 1 else 'left'
-
         ann = self.ax.text(
-            x_pos, y_pos, readout_text,
-            transform=self.ax.transAxes,
-            fontsize=8, verticalalignment='top',
-            horizontalalignment=ha,
+            x_pos, y_pos, '\n'.join(readout_lines), transform=self.ax.transAxes,
+            fontsize=8, verticalalignment='top', horizontalalignment=ha,
             family='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow',
                       edgecolor='#555555', alpha=0.93),
@@ -2048,7 +2153,6 @@ class PlotCanvas(FigureCanvasQTAgg):
             self._cursors[cursor_idx] = {'x': best_x, 'artists': artists}
         else:
             self._cursors.append({'x': best_x, 'artists': artists})
-
         self._update_cursor_delta()
         self.draw_idle()
 
@@ -2069,9 +2173,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         x1 = self._cursors[0]['x']
         x2 = self._cursors[1]['x']
         f_unit = self._get_freq_unit()
-        delta_f = abs(x2 - x1)
-
-        delta_lines = [f'Δf = {delta_f:.6g} {f_unit}']
+        delta_lines = [f'Δf = {abs(x2 - x1):.6g} {f_unit}']
         for ln in self.ax.lines:
             xd = ln.get_xdata()
             yd = ln.get_ydata()
@@ -2082,17 +2184,15 @@ class PlotCanvas(FigureCanvasQTAgg):
                 continue
             xd = np.asarray(xd, dtype=float)
             yd = np.asarray(yd, dtype=float)
-            idx1 = int(np.argmin(np.abs(xd - x1)))
-            idx2 = int(np.argmin(np.abs(xd - x2)))
-            dval = yd[idx2] - yd[idx1]
-            delta_lines.append(f'  Δ{lbl}: {dval:+.4g}')
+            idx1 = self._nearest_x_index(xd, x1)
+            idx2 = self._nearest_x_index(xd, x2)
+            if idx1 is None or idx2 is None:
+                continue
+            delta_lines.append(f'  Δ{lbl}: {yd[idx2] - yd[idx1]:+.4g}')
 
-        delta_text = '\n'.join(delta_lines)
         self._cursor_delta_ann = self.ax.text(
-            0.5, 0.02, delta_text,
-            transform=self.ax.transAxes,
-            fontsize=8, verticalalignment='bottom',
-            horizontalalignment='center',
+            0.5, 0.02, '\n'.join(delta_lines), transform=self.ax.transAxes,
+            fontsize=8, verticalalignment='bottom', horizontalalignment='center',
             family='monospace',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#FFFFDD',
                       edgecolor='#888888', alpha=0.93),
@@ -2108,7 +2208,7 @@ class PlotCanvas(FigureCanvasQTAgg):
                 pass
             self._cursor_delta_ann = None
 
-    def clear_all_cursors(self):
+    def clear_all_cursors(self, redraw=True):
         for c in self._cursors:
             for a in c['artists']:
                 try:
@@ -2117,12 +2217,8 @@ class PlotCanvas(FigureCanvasQTAgg):
                     pass
         self._cursors = []
         self._clear_cursor_delta()
-        self.draw_idle()
-
-
-# ---------------------------------------------------------------------------
-# File List Widget
-# ---------------------------------------------------------------------------
+        if redraw:
+            self.draw_idle()
 
 class FileListWidget(QListWidget):
     """Widget displaying loaded SNP files with multi-select support."""
@@ -2201,15 +2297,22 @@ class FileListWidget(QListWidget):
         basename = os.path.basename(filepath)
         n_ports = network.number_of_ports
         n_points = len(network.frequency.f)
+        if n_points == 0:
+            return False, "The file contains no frequency points."
         freq_start = network.frequency.f_scaled[0]
         freq_stop = network.frequency.f_scaled[-1]
         freq_unit = network.frequency.unit
 
         display = f"{basename}  [{n_ports}-port, {n_points} pts]"
 
-        # Avoid duplicates
+        # Every list item needs its own key, including repeated loads.
         if display in self._networks:
             display = f"{display} ({filepath})"
+        base_display = display
+        suffix = 2
+        while display in self._networks:
+            display = f"{base_display} [{suffix}]"
+            suffix += 1
 
         self._networks[display] = (basename, network)
         self._filepaths[display] = filepath
@@ -2225,13 +2328,32 @@ class FileListWidget(QListWidget):
         item.setSelected(True)
         return True, ""
 
+    def add_networks(self, filepaths):
+        """Load a batch and update the surrounding UI once."""
+        errors = []
+        blocked = self.blockSignals(True)
+        try:
+            for filepath in filepaths:
+                ok, error = self.add_network(filepath)
+                if not ok:
+                    errors.append(f"{os.path.basename(filepath)}: {error}")
+        finally:
+            self.blockSignals(blocked)
+        self.selection_updated.emit()
+        return errors
+
     def remove_selected(self):
         """Remove all currently selected files."""
-        for item in self.selectedItems():
-            text = item.text()
-            self._networks.pop(text, None)
-            self._filepaths.pop(text, None)
-            self.takeItem(self.row(item))
+        blocked = self.blockSignals(True)
+        try:
+            for item in self.selectedItems():
+                text = item.text()
+                self._networks.pop(text, None)
+                self._filepaths.pop(text, None)
+                self.takeItem(self.row(item))
+        finally:
+            self.blockSignals(blocked)
+        self.selection_updated.emit()
 
     def get_selected_networks(self):
         """Return list of (short_name, Network) for all selected items."""
@@ -2269,10 +2391,15 @@ class FileListWidget(QListWidget):
 
     def select_by_indices(self, indices):
         """Clear current selection and select items by index."""
-        self.clearSelection()
-        for i in indices:
-            if 0 <= i < self.count():
-                self.item(i).setSelected(True)
+        blocked = self.blockSignals(True)
+        try:
+            self.clearSelection()
+            for i in indices:
+                if 0 <= i < self.count():
+                    self.item(i).setSelected(True)
+        finally:
+            self.blockSignals(blocked)
+        self.selection_updated.emit()
 
     def clear_all(self):
         """Remove all files."""
@@ -2332,7 +2459,11 @@ class ParameterSelector(QGroupBox):
         """Rebuild checkboxes for the union of ports across all networks.
         networks: list of (short_name, Network) tuples.
         """
-        # Remember current checked state
+        max_ports = max((net.number_of_ports for _, net in networks), default=0)
+        if len(self._checkboxes) == max_ports * max_ports:
+            return
+        # An intentionally empty selection must survive a port-count change.
+        had_checkboxes = bool(self._checkboxes)
         prev_checked = set()
         for cb in self._checkboxes:
             if cb.isChecked():
@@ -2348,9 +2479,9 @@ class ParameterSelector(QGroupBox):
         if not networks:
             return
 
-        # Use the max port count across all selected networks
-        max_ports = max(net.number_of_ports for _, net in networks)
         p = self._param_type
+        default = settings.default_params_for(p)
+        default = None if default is None else set(default)
 
         for m in range(max_ports):
             for n in range(max_ports):
@@ -2358,10 +2489,9 @@ class ParameterSelector(QGroupBox):
                 cb.setProperty('row', m)
                 cb.setProperty('col', n)
                 # Restore previous state, or use settings defaults on first build
-                if prev_checked:
+                if had_checkboxes:
                     cb.setChecked((m, n) in prev_checked)
                 else:
-                    default = settings.default_params_for(self._param_type)
                     if default is None:  # 'all' sentinel
                         cb.setChecked(True)
                     else:
@@ -2514,8 +2644,9 @@ class ConversionPanel(QGroupBox):
 
         try:
             z0 = self.z0_spin.value()
-            net_copy = network.copy()
-            if z0 != 50.0:
+            net_copy = network
+            if not np.all(network.z0 == z0):
+                net_copy = network.copy()
                 net_copy.renormalize(z0)
 
             if param != 's':
@@ -2534,46 +2665,56 @@ class ConversionPanel(QGroupBox):
             )
 
     def _write_converted(self, network, filepath, param, form, z0):
-        """Write network with parameter conversion."""
-        freq = network.frequency
+        """Write Touchstone 2.0 data in bounded chunks.
 
+        Version 2.0 stores Z/Y in physical units. Legacy files instead imply
+        normalized values, so a versionless header would change the network
+        when read back. Two-port order is explicit; larger matrices use rows.
+        """
+        param, form = param.lower(), form.lower()
+        if param not in ('s', 'z', 'y') or form not in ('ri', 'ma', 'db'):
+            raise ValueError('Unsupported Touchstone parameter or format')
+        freq = network.frequency
         if param == 'z':
             data = network.z
         elif param == 'y':
             data = network.y
         else:
             data = network.s
-
         n_ports = network.number_of_ports
 
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8', newline='') as f:
             freq_unit = freq.unit.upper()
-            f.write(f"! Converted by SNP Viewer\n")
+            f.write("! Converted by SNP Viewer\n")
+            f.write("[Version] 2.0\n")
             f.write(f"# {freq_unit} {param.upper()} {form.upper()} R {z0}\n")
+            f.write(f"[Number of Ports] {n_ports}\n")
+            if n_ports == 2:
+                f.write("[Two-Port Data Order] 21_12\n")
+            f.write(f"[Number of Frequencies] {len(freq.f)}\n")
+            f.write("[Network Data]\n")
 
-            # Build a 2-D matrix [N_freq × (1 + 2*n_ports²)] then write
-            # in one C-level pass with np.savetxt — much faster than a
-            # Python loop over frequency points.
-            cols = [freq.f]
-            for m in range(n_ports):
-                for n in range(n_ports):
-                    val = data[:, m, n]
-                    if form == 'ri':
-                        cols.append(val.real)
-                        cols.append(val.imag)
-                    elif form == 'ma':
-                        cols.append(np.abs(val))
-                        cols.append(np.degrees(np.angle(val)))
-                    else:  # db
-                        cols.append(20 * np.log10(np.abs(val) + 1e-30))
-                        cols.append(np.degrees(np.angle(val)))
-
-            np.savetxt(f, np.column_stack(cols), fmt='%.10g')
-
-
-# ---------------------------------------------------------------------------
-# Main Application Window
-# ---------------------------------------------------------------------------
+            # Keep the formatted numeric buffer near 1 MiB even for large sweeps.
+            width = 1 + 2 * n_ports * n_ports
+            chunk_size = max(1, (1024 * 1024) // (8 * width))
+            scaled_freq = freq.f_scaled
+            for start in range(0, len(scaled_freq), chunk_size):
+                stop = min(start + chunk_size, len(scaled_freq))
+                values = data[start:stop]
+                if n_ports == 2:
+                    values = values.transpose(0, 2, 1)
+                values = values.reshape(stop - start, -1)
+                rows = np.empty((stop - start, width))
+                rows[:, 0] = scaled_freq[start:stop]
+                if form == 'ri':
+                    rows[:, 1::2] = values.real
+                    rows[:, 2::2] = values.imag
+                else:
+                    rows[:, 1::2] = (np.abs(values) if form == 'ma'
+                                     else PlotCanvas._to_db(values))
+                    rows[:, 2::2] = np.degrees(np.angle(values))
+                np.savetxt(f, rows, fmt='%.10g')
+            f.write("[End]\n")
 
 class SNPViewerApp(QMainWindow):
     """Main application window for SNP Viewer."""
@@ -2608,6 +2749,13 @@ class SNPViewerApp(QMainWindow):
         self._grid_state = 0
         self._palette_name = settings.default_palette
         self._markers_enabled = False
+
+        # Collapse bursts of Qt signals (multi-file loading, checkbox changes,
+        # session restore) into one expensive Matplotlib rebuild.
+        self._replot_timer = QTimer(self)
+        self._replot_timer.setSingleShot(True)
+        self._replot_timer.setInterval(15)
+        self._replot_timer.timeout.connect(self._perform_replot)
 
         NatureColors.apply_matplotlib_defaults()
         self._build_ui()
@@ -3120,11 +3268,7 @@ class SNPViewerApp(QMainWindow):
             return
 
         self._save_last_dir(filepaths[0])
-        errors = []
-        for fp in filepaths:
-            ok, err = self.file_list.add_network(fp)
-            if not ok:
-                errors.append(f"{os.path.basename(fp)}: {err}")
+        errors = self.file_list.add_networks(filepaths)
 
         if errors:
             QMessageBox.warning(
@@ -3175,14 +3319,17 @@ class SNPViewerApp(QMainWindow):
         self.conversion_panel.save_network(network)
 
     def _replot(self):
-        """Replot based on current state (all selected files overlaid)."""
-        # Clear any pending Q span and annotations when the plot changes
+        """Request a plot rebuild, coalescing rapid consecutive requests."""
+        self._replot_timer.start()
+
+    def _perform_replot(self):
+        """Perform the actual Matplotlib rebuild for the current UI state."""
         if hasattr(self.canvas, '_q_span') and self.canvas._q_span:
             self.canvas._q_span.set_visible(False)
             self.canvas._q_span = None
         self.canvas._clear_q_annotations()
         self.canvas._clear_change_annotations()
-        self.canvas.clear_all_cursors()
+        self.canvas.clear_all_cursors(redraw=False)
         self.cursor_action.setChecked(False)
         self.canvas.set_cursor_mode(False)
         self.q_action.setChecked(False)
@@ -3196,10 +3343,7 @@ class SNPViewerApp(QMainWindow):
 
         params = self.param_selector.get_selected_params()
         plot_type = self.plot_tab_bar.currentIndex()
-
-        # Math memory kwargs — only pass to plot types that support it
-        mem_kw = dict(mem_network=self._mem_network,
-                      diff_only=self._diff_only)
+        mem_kw = dict(mem_network=self._mem_network, diff_only=self._diff_only)
 
         if plot_type == self.PLOT_MAGNITUDE:
             if self._param_type == 'Z':
@@ -3304,7 +3448,7 @@ class SNPViewerApp(QMainWindow):
     def _on_clear_q(self):
         """Remove Q annotations from the plot."""
         self.canvas._clear_q_annotations()
-        self.canvas.draw()
+        self.canvas.draw_idle()
         self.clear_q_action.setEnabled(False)
         self._update_status("Q annotations cleared.")
 
@@ -3446,7 +3590,7 @@ class SNPViewerApp(QMainWindow):
     def _on_clear_changes(self):
         """Remove change-detection annotations."""
         self.canvas._clear_change_annotations()
-        self.canvas.draw()
+        self.canvas.draw_idle()
         self.clear_changes_action.setEnabled(False)
         self._update_status("Change annotations cleared.")
 
@@ -3495,14 +3639,12 @@ class SNPViewerApp(QMainWindow):
 
     def _on_grid_toggled(self):
         self._grid_state = (self._grid_state + 1) % 3
-        self.canvas._grid_state = self._grid_state
+        self.canvas.set_grid_state(self._grid_state)
         labels = {0: 'Grid: off', 1: 'Grid: major', 2: 'Grid: major + minor'}
         self._update_status(labels[self._grid_state])
-        self._replot()
 
     def _on_transparent_toggled(self, checked):
-        self.canvas._transparent_bg = checked
-        self._replot()
+        self.canvas.set_transparent_background(checked)
         self._update_status(
             "Transparent background ON." if checked
             else "Transparent background OFF."
@@ -3510,8 +3652,7 @@ class SNPViewerApp(QMainWindow):
 
     def _on_markers_toggled(self, checked):
         self._markers_enabled = checked
-        self.canvas._markers_enabled = checked
-        self._replot()
+        self.canvas.set_markers_enabled(checked)
         self._update_status(
             "Markers enabled." if checked else "Markers disabled."
         )
@@ -3692,14 +3833,7 @@ class SNPViewerApp(QMainWindow):
         self._mem_network = None
         self._diff_only = False
 
-        errors = []
-        for fp in state.get("files", []):
-            if os.path.isfile(fp):
-                ok, err = self.file_list.add_network(fp)
-                if not ok:
-                    errors.append(f"{os.path.basename(fp)}: {err}")
-            else:
-                errors.append(f"{os.path.basename(fp)}: file not found")
+        errors = self.file_list.add_networks(state.get("files", []))
 
         if errors:
             QMessageBox.warning(
@@ -3715,7 +3849,7 @@ class SNPViewerApp(QMainWindow):
         self._on_param_type_changed(pt)
 
         checked = state.get("checked_params", [])
-        if checked:
+        if "checked_params" in state:
             checked_set = {(p[0], p[1]) for p in checked}
             for cb in self.param_selector._checkboxes:
                 key = (cb.property('row'), cb.property('col'))
@@ -3893,18 +4027,11 @@ class SNPViewerApp(QMainWindow):
         event.acceptProposedAction()
 
     def dropEvent(self, event):
-        errors = []
-        first_path = None
-        for url in event.mimeData().urls():
-            fp = url.toLocalFile()
-            if fp:
-                if first_path is None:
-                    first_path = fp
-                ok, err = self.file_list.add_network(fp)
-                if not ok:
-                    errors.append(f"{os.path.basename(fp)}: {err}")
-        if first_path:
-            self._save_last_dir(first_path)
+        filepaths = [url.toLocalFile() for url in event.mimeData().urls()
+                     if url.isLocalFile()]
+        errors = self.file_list.add_networks(filepaths)
+        if filepaths:
+            self._save_last_dir(filepaths[0])
         if errors:
             QMessageBox.warning(
                 self, "Load Errors",
